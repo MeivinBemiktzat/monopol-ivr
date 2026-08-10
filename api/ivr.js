@@ -14,18 +14,23 @@
 // Hebrew text. Existence is checked via the Yemot management API (GetTree),
 // cached briefly so we don't hammer it on every message.
 //
-// WAITING / BROADCAST DESIGN (rewritten):
-// `read=` is for collecting a keypress/voice/typed answer — its built-in
-// "no answer" handling always wants to either re-prompt with an error
-// (M1002 "לא הוקשה בחירה") or need an explicit `Ok` (proceed silently) flag
-// on field 12. Neither of those is a good fit for "sit and wait, quietly,
-// while other players act" — there's nothing to answer yet. So idle waiting
-// (waiting for other players to join, waiting for your turn) instead uses
-// `music_on_hold=<name>,<seconds>` which plays hold music for N seconds and
-// then automatically calls us back — no confirm prompts, no "invalid
-// choice" errors, no dead air. On every such callback we check whether
-// anything changed (game started / new turn / new game-log entries this
-// player hasn't heard yet) and, if so, announce it before resuming.
+// WAITING / BROADCAST DESIGN:
+// `music_on_hold` as a server response action is a terminal action: per
+// Yemot's API-module docs, every response action other than `credit_card`
+// and `read` ends the user's dialog with our server once it finishes (the
+// call does NOT get sent back to us automatically). It is NOT a polling
+// primitive, so it must never be used for "wait, then call us back".
+// `read=` is the one response type designed to keep an ongoing dialog with
+// our server alive ("read - קבלת נתונים נוספים מהמשתמש ושליחתם לשרת"). So
+// idle waiting (waiting for other players to join, waiting for your turn)
+// uses a `read=` with a short timeout, no required input, and field 12
+// ("onEmpty") set to `Ok` — the caller sits quietly (optionally hearing the
+// configured hold-music file), the timeout elapses with no keypress, and
+// because onEmpty=Ok the system proceeds immediately WITHOUT ever playing
+// M1002 "לא הוקשה בחירה", automatically calling our server back to check
+// state again. On every such callback we check whether anything changed
+// (game started / new turn / new game-log entries this player hasn't heard
+// yet) and, if so, announce it before resuming the wait or the turn menu.
 // ============================================================================
 
 const board = require('./board.json');
@@ -151,54 +156,83 @@ function menuReadParams({
 }
 
 // Typed free-text name entry via the physical/Hebrew keypad-letters mode.
-// Per Yemot docs the dataType value itself is "HebrewKeyboard"; fields after
-// it are the same generic slots (timeout, allowed keys, etc.) — we only need
-// to set the essentials and MUST still disable the confirm prompt (field 15
-// counted from the dataType slot for keypress-family types).
+// IMPORTANT: the 15 fields are the SAME positional slots for every data
+// type — the "how to read back what was entered" table (Number / Digits /
+// HebrewKeyboard / EnglishKeyboard / DigitsKeyboard / ...) lives at field 6
+// ("playback style"), not field 3. Field 3/4 are max/min DIGIT counts, which
+// don't apply to keyboard-text entry, so they're left blank here. Putting
+// "HebrewKeyboard" in field 3 (a numeric slot) is what silently made Yemot
+// fall back to its default plain digit-keypress reading (bug: name could
+// only be typed in digits) and, together with that, its default behavior
+// for everything else in the array too — including the field 15 confirm
+// prompt ("לאישור הקישו אחת"), even though 'no' was literally present at
+// position 15 in the (mis-shifted) array. Fixed by keeping every field in
+// its correct documented slot.
 function keyboardReadParams({ name, timeout = 25 }) {
   return [
     name, // 1
     '', // 2 useExisting
-    'HebrewKeyboard', // 3 dataType
-    '', // 4 (unused for keyboard)
+    '', // 3 max digits -> n/a for keyboard entry
+    '', // 4 min digits -> n/a for keyboard entry
     timeout, // 5 timeout seconds
-    '', // 6
-    'no', // 7
-    'no', // 8
-    '', // 9
-    '', // 10
-    '', // 11
+    'HebrewKeyboard', // 6 playback/dataType style
+    'no', // 7 blockStar
+    'no', // 8 blockZero
+    '', // 9 keyReplace
+    '', // 10 allowedKeys
+    1, // 11 retries
     'Ok', // 12 onEmpty -> proceed rather than error if somehow empty
-    '', // 13
+    '', // 13 valueWhenEmpty
     '', // 14 InsertLettersTypeChangeNo left default (allow language switch)
+    'no', // 15 askConfirm -> disabled
+  ].join(',');
+}
+
+// Silent idle-wait "poll": no real input expected. We use `read=` (not
+// music_on_hold — see header note) purely so Yemot calls us back once the
+// timeout elapses, without ever announcing M1002 or asking for confirm.
+function waitReadParams() {
+  return [
+    'POLL', // 1
+    '', // 2 useExisting
+    '', // 3 max digits
+    '', // 4 min digits
+    HOLD_SECONDS, // 5 timeout seconds
+    'NO', // 6 playback -> never announce back a stray keypress
+    'no', // 7 blockStar
+    'no', // 8 blockZero
+    '', // 9 keyReplace
+    '', // 10 allowedKeys
+    1, // 11 retries
+    'Ok', // 12 onEmpty -> proceed silently, no M1002, no re-prompt
+    '', // 13 valueWhenEmpty
+    '', // 14
     'no', // 15 askConfirm -> disabled
   ].join(',');
 }
 
 // Builds the final response string.
 // - If `readParams` given: "read=<spoken prompt>=<readParams>"
-// - Else if `hold` given: "id_list_message=<prompt>&music_on_hold=<hold>" —
-//   used for idle waiting; Yemot plays hold music and calls us back after
-//   the given seconds, no confirm/Error prompts involved at all.
+// - Else if `wait` is true: "read=<prompt (+ hold-music file if configured)>=<waitReadParams()>" —
+//   used for idle waiting. This is a real `read=` dialog (see header note),
+//   so Yemot genuinely calls us back after HOLD_SECONDS — quietly, playing
+//   the configured hold-music file if YEMOT_HOLD_MUSIC is set, with no
+//   confirm prompt and no "invalid/empty choice" errors.
 // - Else: "id_list_message=<prompt>" optionally chained with `extra`
 //   (e.g. go_to_folder=...).
-function respond(segments, { readParams, hold, extra } = {}) {
+function respond(segments, { readParams, wait, extra } = {}) {
   const prompt = joinSegments(segments);
   if (readParams) {
     const body = `read=${prompt}=${readParams}`;
     return extra ? `${body}&${extra}` : body;
   }
-  if (hold) {
-    const holdAction = `music_on_hold=${hold}`;
-    return prompt ? `id_list_message=${prompt}&${holdAction}` : holdAction;
+  if (wait) {
+    const holdMusicSegment = HOLD_MUSIC_NAME ? `f-${HOLD_MUSIC_NAME}` : '';
+    const waitPrompt = joinSegments([prompt, holdMusicSegment]);
+    return `read=${waitPrompt}=${waitReadParams()}`;
   }
   const body = `id_list_message=${prompt}`;
   return extra ? `${body}&${extra}` : body;
-}
-
-// Standard "wait quietly, then call us back" action string for polling.
-function waitAction() {
-  return `${HOLD_MUSIC_NAME},${HOLD_SECONDS}`;
 }
 
 // ============================================================================
@@ -433,7 +467,7 @@ module.exports = async (req, res) => {
 
       if (!readyToStart) {
         const t2 = await msg('s1013', 'ממתינים לשאר השחקנים להצטרף');
-        res.status(200).send(respond([t1, t2], { hold: waitAction() }));
+        res.status(200).send(respond([t1, t2], { wait: true }));
         return;
       }
 
@@ -463,7 +497,7 @@ module.exports = async (req, res) => {
       if (!game.started) {
         // Still waiting room — poll via hold music, check if it started meanwhile
         const t = await msg('s1013', 'ממתינים לשאר השחקנים להצטרף');
-        res.status(200).send(respond([t], { hold: waitAction() }));
+        res.status(200).send(respond([t], { wait: true }));
         return;
       }
 
@@ -509,7 +543,7 @@ async function sendGameState(res, game, player, prefixSegments = []) {
   }
 
   // Not my turn: play any announcements, then quietly hold and re-poll
-  res.status(200).send(respond([...prefixSegments, ...announceSegments], { hold: waitAction() }));
+  res.status(200).send(respond([...prefixSegments, ...announceSegments], { wait: true }));
 }
 
 async function handleInGameAction(req, res, game, player, params) {
@@ -862,5 +896,5 @@ async function endTurn(res, game, player) {
 
   const t = await msg('sENDTURN', `סיימתם את תורכם. התור עובר ל${nextPlayer.name}`);
   // The player who just finished waits (hold music) until their next turn.
-  res.status(200).send(respond([t], { hold: waitAction() }));
+  res.status(200).send(respond([t], { wait: true }));
 }
