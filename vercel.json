@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/ivr.js": {
+      "maxDuration": 15
+    }
+  }
+}

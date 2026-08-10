@@ -1,0 +1,10 @@
+{
+  "name": "monopoly-ivr",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Yemot Hamashiach IVR API-module handler for a full telephone Monopoly game (Israeli cities board), backed by Upstash Redis.",
+  "main": "api/ivr.js",
+  "engines": {
+    "node": ">=18"
+  }
+}
