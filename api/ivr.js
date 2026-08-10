@@ -250,7 +250,17 @@ function respond(segments, { readParams, wait, waitParamName, extra } = {}) {
   }
   if (wait) {
     const holdMusicSegment = HOLD_MUSIC_NAME ? `f-${HOLD_MUSIC_NAME}` : '';
-    const waitPrompt = joinSegments([prompt, holdMusicSegment]);
+    // If there are no announcements and no hold-music file configured, `prompt`
+    // and `holdMusicSegment` are both empty, which would produce a bare
+    // "read==<params>" with nothing before the second "=". That shape isn't
+    // covered by Yemot's documented read= format (always "read=<message>=<data>"),
+    // so to stay safe we always send a minimal silent TTS segment instead of
+    // truly nothing — this keeps the dialog alive with our server exactly the
+    // same way (still a real read=, still calls us back after HOLD_SECONDS)
+    // without risking Yemot treating the empty message part as malformed and
+    // falling back to its own default routing (bouncing the caller away from
+    // our flow, e.g. back to the main menu).
+    const waitPrompt = joinSegments([prompt, holdMusicSegment]) || 't- ';
     return `read=${waitPrompt}=${waitReadParams(waitParamName)}`;
   }
   const body = `id_list_message=${prompt}`;
@@ -538,6 +548,7 @@ module.exports = async (req, res) => {
         // Still waiting room — poll via hold music, check if it started meanwhile
         const pName = nextParamName(flow);
         flow.expect = pName;
+        flow.expectKind = 'poll';
         await saveFlow(flow);
         const t = await msg('s1013', 'ממתינים לשאר השחקנים להצטרף');
         res.status(200).send(respond([t], { wait: true, waitParamName: pName }));
