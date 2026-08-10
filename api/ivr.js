@@ -115,6 +115,28 @@ function joinSegments(segments) {
   return segments.filter(Boolean).join('.');
 }
 
+// ---- Unique read-parameter names (CRITICAL Yemot API-module quirk) --------
+// Per Yemot's own API-module documentation: every value the caller has ever
+// entered during the call is appended to (not replaced in) the parameter
+// set sent to our server on every subsequent request. If we reuse the same
+// read parameter name (e.g. "ACTION") across multiple reads within one
+// call, the OLD value from a previous turn/menu keeps arriving alongside
+// (or instead of) the NEW one, and our server cannot tell them apart. This
+// caused two serious bugs: a waiting player's poll callback being
+// misread as a stale leftover ACTION and routed incorrectly (kicked back
+// to the main menu), and the active player's fresh keypress being masked
+// by an old accumulated value (menu options appearing to do nothing).
+// Fix: every single read= we issue uses a BRAND NEW, never-before-used
+// parameter name (built from a per-call monotonically increasing counter
+// stored in `flow.seq`), and we always read back the value under that
+// exact name — never a fixed name like "ACTION" — so stale accumulated
+// parameters from earlier in the call can never be mistaken for the
+// answer to the read we just issued.
+function nextParamName(flow) {
+  flow.seq = (flow.seq || 0) + 1;
+  return `P${flow.seq}`;
+}
+
 // ---- read= builder -----------------------------------------------------
 // Correct Yemot field order for a keypress-type read (fields 1-15):
 //  1 paramName          2 useExisting        3 maxDigits
@@ -191,9 +213,9 @@ function keyboardReadParams({ name, timeout = 25 }) {
 // Silent idle-wait "poll": no real input expected. We use `read=` (not
 // music_on_hold — see header note) purely so Yemot calls us back once the
 // timeout elapses, without ever announcing M1002 or asking for confirm.
-function waitReadParams() {
+function waitReadParams(name) {
   return [
-    'POLL', // 1
+    name, // 1
     '', // 2 useExisting
     '', // 3 max digits
     '', // 4 min digits
@@ -220,7 +242,7 @@ function waitReadParams() {
 //   confirm prompt and no "invalid/empty choice" errors.
 // - Else: "id_list_message=<prompt>" optionally chained with `extra`
 //   (e.g. go_to_folder=...).
-function respond(segments, { readParams, wait, extra } = {}) {
+function respond(segments, { readParams, wait, waitParamName, extra } = {}) {
   const prompt = joinSegments(segments);
   if (readParams) {
     const body = `read=${prompt}=${readParams}`;
@@ -229,7 +251,7 @@ function respond(segments, { readParams, wait, extra } = {}) {
   if (wait) {
     const holdMusicSegment = HOLD_MUSIC_NAME ? `f-${HOLD_MUSIC_NAME}` : '';
     const waitPrompt = joinSegments([prompt, holdMusicSegment]);
-    return `read=${waitPrompt}=${waitReadParams()}`;
+    return `read=${waitPrompt}=${waitReadParams(waitParamName)}`;
   }
   const body = `id_list_message=${prompt}`;
   return extra ? `${body}&${extra}` : body;
@@ -328,14 +350,22 @@ module.exports = async (req, res) => {
     const flowKey = `call:${callId}`;
     let flow = JSON.parse((await rGet(flowKey)) || '{}');
 
+    // Helper to persist the flow object AND always refresh its TTL, so a
+    // long game (many idle-wait polls while it's not your turn) never lets
+    // the call's flow record silently expire mid-game and bounce the
+    // caller back to the main menu.
+    const saveFlow = async (f) => rSet(flowKey, JSON.stringify(f), 3600);
+
     // ---- Entry point ---------------------------------------------------
     if (!flow.step) {
-      flow = { step: 'main_menu' };
-      await rSet(flowKey, JSON.stringify(flow), 3600);
+      flow = { step: 'main_menu', seq: 0 };
+      const pName = nextParamName(flow);
+      flow.expect = pName;
+      await saveFlow(flow);
       const welcome = await msg('s1000', 'ברוכים הבאים למונופול הטלפוני. להתחלת משחק חדש הקישו אחת. להצטרפות למשחק קיים הקישו שתיים');
       res.status(200).send(
         respond([welcome], {
-          readParams: menuReadParams({ name: 'CHOICE', allowed: '12' }),
+          readParams: menuReadParams({ name: pName, allowed: '12' }),
         })
       );
       return;
@@ -343,23 +373,27 @@ module.exports = async (req, res) => {
 
     // ---- MAIN MENU -------------------------------------------------------
     if (flow.step === 'main_menu') {
-      const choice = params.CHOICE;
+      const choice = params[flow.expect];
       if (choice === '1') {
-        flow = { step: 'ask_player_count' };
-        await rSet(flowKey, JSON.stringify(flow), 3600);
+        flow = { step: 'ask_player_count', seq: flow.seq };
+        const pName = nextParamName(flow);
+        flow.expect = pName;
+        await saveFlow(flow);
         const t = await msg('s1001', 'כמה שחקנים ישתתפו במשחק? הקישו מספר בין שתיים לשש');
         res.status(200).send(
-          respond([t], { readParams: menuReadParams({ name: 'PCOUNT', allowed: '23456' }) })
+          respond([t], { readParams: menuReadParams({ name: pName, allowed: '23456' }) })
         );
         return;
       }
       if (choice === '2') {
-        flow = { step: 'ask_join_code' };
-        await rSet(flowKey, JSON.stringify(flow), 3600);
+        flow = { step: 'ask_join_code', seq: flow.seq };
+        const pName = nextParamName(flow);
+        flow.expect = pName;
+        await saveFlow(flow);
         const t = await msg('s1002', 'הקישו את קוד המשחק בן שלוש הספרות');
         res.status(200).send(
           respond([t], {
-            readParams: menuReadParams({ name: 'JOINCODE', max: 3, min: 3, playback: 'Digits' }),
+            readParams: menuReadParams({ name: pName, max: 3, min: 3, playback: 'Digits' }),
           })
         );
         return;
@@ -371,7 +405,7 @@ module.exports = async (req, res) => {
 
     // ---- CREATE GAME: ask player count -> create -> ask name -------------
     if (flow.step === 'ask_player_count') {
-      const n = parseInt(params.PCOUNT, 10);
+      const n = parseInt(params[flow.expect], 10);
       if (!n || n < 2 || n > 6) {
         const err = await msg('s1004', 'מספר לא תקין. נסו שוב');
         res.status(200).send(respond([err], { extra: `go_to_folder=/${ext}` }));
@@ -387,15 +421,17 @@ module.exports = async (req, res) => {
       game.expectedPlayers = n;
       await saveGame(code, game);
 
-      flow = { step: 'ask_name_new', code };
-      await rSet(flowKey, JSON.stringify(flow), 3600);
+      flow = { step: 'ask_name_new', code, seq: flow.seq };
+      const pName = nextParamName(flow);
+      flow.expect = pName;
+      await saveFlow(flow);
 
       const t1 = await msg('s1005', 'נוצר משחק חדש. קוד המשחק שלכם הוא');
       const codeDigits = `d-${code}`;
       const t2 = await msg('s1006', 'שמרו את הקוד ומסרו אותו לשאר השחקנים. כעת הקלידו את שמכם באמצעות המקלדת ולאחר מכן הקישו סולמית');
       res.status(200).send(
         respond([t1, codeDigits, t2], {
-          readParams: keyboardReadParams({ name: 'PNAME' }),
+          readParams: keyboardReadParams({ name: pName }),
         })
       );
       return;
@@ -403,7 +439,7 @@ module.exports = async (req, res) => {
 
     // ---- JOIN GAME: ask code -> validate -> ask name ----------------------
     if (flow.step === 'ask_join_code') {
-      const code = params.JOINCODE;
+      const code = params[flow.expect];
       const game = await loadGame(code);
       if (!game) {
         const err = await msg('s1007', 'קוד משחק לא נמצא');
@@ -420,11 +456,13 @@ module.exports = async (req, res) => {
         res.status(200).send(respond([err], { extra: `go_to_folder=/${ext}` }));
         return;
       }
-      flow = { step: 'ask_name_join', code };
-      await rSet(flowKey, JSON.stringify(flow), 3600);
+      flow = { step: 'ask_name_join', code, seq: flow.seq };
+      const pName = nextParamName(flow);
+      flow.expect = pName;
+      await saveFlow(flow);
       const t = await msg('s1010', 'הקלידו את שמכם באמצעות המקלדת ולאחר מכן הקישו סולמית');
       res.status(200).send(
-        respond([t], { readParams: keyboardReadParams({ name: 'PNAME' }) })
+        respond([t], { readParams: keyboardReadParams({ name: pName }) })
       );
       return;
     }
@@ -438,7 +476,7 @@ module.exports = async (req, res) => {
         res.status(200).send(respond([err], { extra: `go_to_folder=/${ext}` }));
         return;
       }
-      const name = (params.PNAME || 'שחקן').toString().trim() || 'שחקן';
+      const name = (params[flow.expect] || 'שחקן').toString().trim() || 'שחקן';
       const player = {
         id: `p${game.players.length + 1}`,
         callId,
@@ -460,14 +498,16 @@ module.exports = async (req, res) => {
       }
       await saveGame(code, game);
 
-      flow = { step: 'in_game', code, playerId: player.id };
-      await rSet(flowKey, JSON.stringify(flow), 3600);
+      flow = { step: 'in_game', code, playerId: player.id, seq: flow.seq };
 
       const t1 = await msg('s1012', `נרשמת למשחק בהצלחה ${name}. יש לכם ${board.startMoney} שקלים`);
 
       if (!readyToStart) {
+        const pName = nextParamName(flow);
+        flow.expect = pName;
+        await saveFlow(flow);
         const t2 = await msg('s1013', 'ממתינים לשאר השחקנים להצטרף');
-        res.status(200).send(respond([t1, t2], { wait: true }));
+        res.status(200).send(respond([t1, t2], { wait: true, waitParamName: pName }));
         return;
       }
 
@@ -475,7 +515,7 @@ module.exports = async (req, res) => {
       // own next poll) will now see started=true and move into turn flow.
       player.lastSeenSeq = game.logSeq; // they already heard "game starting" live
       await saveGame(code, game);
-      return sendGameState(res, game, player, [t1]);
+      return sendGameState(res, flow, saveFlow, game, player, [t1]);
     }
 
     // ---- In-game: everything else routes through here ----------------------
@@ -496,12 +536,15 @@ module.exports = async (req, res) => {
 
       if (!game.started) {
         // Still waiting room — poll via hold music, check if it started meanwhile
+        const pName = nextParamName(flow);
+        flow.expect = pName;
+        await saveFlow(flow);
         const t = await msg('s1013', 'ממתינים לשאר השחקנים להצטרף');
-        res.status(200).send(respond([t], { wait: true }));
+        res.status(200).send(respond([t], { wait: true, waitParamName: pName }));
         return;
       }
 
-      return handleInGameAction(req, res, game, player, params);
+      return handleInGameAction(res, flow, saveFlow, game, player, params);
     }
 
     // Unknown step fallback
@@ -520,8 +563,14 @@ module.exports = async (req, res) => {
 
 // Central dispatcher called whenever we need to decide what THIS player
 // should hear right now: is it their turn (show action menu), or should
-// they hear pending log updates and keep waiting (hold music loop)?
-async function sendGameState(res, game, player, prefixSegments = []) {
+// they hear pending log updates and keep waiting (hold music loop).
+//
+// `flow`/`saveFlow` let us mint a BRAND NEW, never-before-used Yemot read
+// parameter name for whatever we ask next (see nextParamName() for why:
+// Yemot resends every previously-collected parameter on every request, so
+// reusing a fixed name like "ACTION" across turns/menus causes stale old
+// values to be mistaken for fresh ones).
+async function sendGameState(res, flow, saveFlow, game, player, prefixSegments = []) {
   const active = currentPlayer(game);
   const unseen = unseenLogFor(game, player.lastSeenSeq);
   const announceSegments = [];
@@ -534,26 +583,63 @@ async function sendGameState(res, game, player, prefixSegments = []) {
   if (active.id === player.id && !active.bankrupt) {
     const t1 = await msg('s1018', `זהו תורך ${player.name}. יש לכם ${player.money} שקלים`);
     const t2 = await msg('s1019', 'להטלת קוביות הקישו אחת. לשמיעת מצב אישי הקישו שתיים. לבניית בתים הקישו שלוש. לסיום התור הקישו ארבע');
+    const pName = nextParamName(flow);
+    flow.expect = pName;
+    flow.expectKind = 'action';
+    await saveFlow(flow);
     res.status(200).send(
       respond([...prefixSegments, ...announceSegments, t1, t2], {
-        readParams: menuReadParams({ name: 'ACTION', allowed: '1234' }),
+        readParams: menuReadParams({ name: pName, allowed: '1234' }),
       })
     );
     return;
   }
 
   // Not my turn: play any announcements, then quietly hold and re-poll
-  res.status(200).send(respond([...prefixSegments, ...announceSegments], { wait: true }));
+  const pName = nextParamName(flow);
+  flow.expect = pName;
+  flow.expectKind = 'poll';
+  await saveFlow(flow);
+  res.status(200).send(respond([...prefixSegments, ...announceSegments], { wait: true, waitParamName: pName }));
 }
 
-async function handleInGameAction(req, res, game, player, params) {
-  const action = params.ACTION;
-  const buyChoice = params.BUYCHOICE;
+// Sends `segments` and re-arms the ACTION menu (digits 1-4) using a fresh,
+// never-before-used read parameter name (see nextParamName()).
+async function sendActionMenu(res, flow, saveFlow, segments) {
+  const pName = nextParamName(flow);
+  flow.expect = pName;
+  flow.expectKind = 'action';
+  await saveFlow(flow);
+  res.status(200).send(
+    respond(segments, { readParams: menuReadParams({ name: pName, allowed: '1234' }) })
+  );
+}
 
-  // Coming back from a hold-music wait (no ACTION param at all) — just
-  // re-evaluate state: announce anything new, resume waiting or show menu.
+// Sends `segments` and arms a BUYCHOICE-style menu (digits 1-2) using a
+// fresh, never-before-used read parameter name.
+async function sendBuyMenu(res, flow, saveFlow, segments) {
+  const pName = nextParamName(flow);
+  flow.expect = pName;
+  flow.expectKind = 'buy';
+  await saveFlow(flow);
+  res.status(200).send(
+    respond(segments, { readParams: menuReadParams({ name: pName, allowed: '12' }) })
+  );
+}
+
+async function handleInGameAction(res, flow, saveFlow, game, player, params) {
+  const expectKind = flow.expectKind;
+  const value = flow.expect ? params[flow.expect] : undefined;
+  const action = expectKind === 'action' ? value : undefined;
+  const buyChoice = expectKind === 'buy' ? value : undefined;
+
+  // Coming back from a hold-music wait, or with no usable value at all —
+  // just re-evaluate state: announce anything new, resume waiting or show
+  // the turn menu. We key off `expectKind`/the exact param name we asked
+  // for last time, never a fixed name, so a stale accumulated value from
+  // earlier in the call can never be misread as a fresh answer.
   if (action === undefined && buyChoice === undefined) {
-    return sendGameState(res, game, player, []);
+    return sendGameState(res, flow, saveFlow, game, player, []);
   }
 
   const active = currentPlayer(game);
@@ -561,24 +647,24 @@ async function handleInGameAction(req, res, game, player, params) {
 
   if (!isMyTurn) {
     // Shouldn't normally get an ACTION here, but guard anyway
-    return sendGameState(res, game, player, []);
+    return sendGameState(res, flow, saveFlow, game, player, []);
   }
 
-  if (game.pendingBuy !== null && game.pendingBuy !== undefined && buyChoice !== undefined) {
-    return handleBuyDecision(res, game, player, buyChoice);
+  if (expectKind === 'buy' && game.pendingBuy !== null && game.pendingBuy !== undefined && buyChoice !== undefined) {
+    return handleBuyDecision(res, flow, saveFlow, game, player, buyChoice);
   }
 
-  if (action === '1') return rollDiceAndMove(res, game, player);
-  if (action === '2') return announcePersonalStatus(res, game, player);
-  if (action === '3') return handleBuildHouses(res, game, player);
-  if (action === '4') return endTurn(res, game, player);
+  if (action === '1') return rollDiceAndMove(res, flow, saveFlow, game, player);
+  if (action === '2') return announcePersonalStatus(res, flow, saveFlow, game, player);
+  if (action === '3') return handleBuildHouses(res, flow, saveFlow, game, player);
+  if (action === '4') return endTurn(res, flow, saveFlow, game, player);
 
   // Shouldn't be reachable since `allowed` restricts input to 1-4, but keep
   // a safe fallback that re-shows the menu without an error tone.
-  return sendGameState(res, game, player, []);
+  return sendGameState(res, flow, saveFlow, game, player, []);
 }
 
-async function rollDiceAndMove(res, game, player) {
+async function rollDiceAndMove(res, flow, saveFlow, game, player) {
   const d1 = 1 + Math.floor(Math.random() * 6);
   const d2 = 1 + Math.floor(Math.random() * 6);
   const isDouble = d1 === d2;
@@ -600,10 +686,7 @@ async function rollDiceAndMove(res, game, player) {
         player.lastSeenSeq = game.logSeq;
         await saveGame(game.code, game);
         const t = await msg('s1020', `הטלתם ${d1} ו${d2}. נשארתם בכלא`);
-        res.status(200).send(
-          respond([t], { readParams: menuReadParams({ name: 'ACTION', allowed: '1234' }) })
-        );
-        return;
+        return sendActionMenu(res, flow, saveFlow, [t]);
       }
     }
   }
@@ -617,10 +700,7 @@ async function rollDiceAndMove(res, game, player) {
       player.lastSeenSeq = game.logSeq;
       await saveGame(game.code, game);
       const t = await msg('s1021', 'שלוש פעמים דאבל ברציפות. אתם נשלחים לכלא');
-      res.status(200).send(
-        respond([t], { readParams: menuReadParams({ name: 'ACTION', allowed: '1234' }) })
-      );
-      return;
+      return sendActionMenu(res, flow, saveFlow, [t]);
     }
   } else {
     player.doublesStreak = 0;
@@ -639,7 +719,7 @@ async function rollDiceAndMove(res, game, player) {
   const segments = [diceMsg];
   if (passedGo) segments.push(await msg('s1022', `עברתם בהתחלה וקיבלתם ${board.goMoney} שקלים`));
 
-  return resolveSquare(res, game, player, square, segments);
+  return resolveSquare(res, flow, saveFlow, game, player, square, segments);
 }
 
 function sendToJail(player) {
@@ -648,33 +728,27 @@ function sendToJail(player) {
   player.jailTurns = 0;
 }
 
-async function resolveSquare(res, game, player, square, segments) {
+async function resolveSquare(res, flow, saveFlow, game, player, square, segments) {
   if (square.type === 'gotojail') {
     sendToJail(player);
     segments.push(await msg('s1023', 'נחתתם על לך לכלא. אתם נשלחים לכלא'));
     player.lastSeenSeq = game.logSeq;
     await saveGame(game.code, game);
-    res.status(200).send(
-      respond(segments, { readParams: menuReadParams({ name: 'ACTION', allowed: '1234' }) })
-    );
-    return;
+    return sendActionMenu(res, flow, saveFlow, segments);
   }
 
   if (square.type === 'tax') {
     player.money -= square.amount;
     await broadcastLog(game, `${player.name} שילם מס בסך ${square.amount} שקלים`);
     segments.push(await msg('sTAX', `שילמתם מס בסך ${priceText(square.amount)}`));
-    return checkBankruptcyThenContinue(res, game, player, segments);
+    return checkBankruptcyThenContinue(res, flow, saveFlow, game, player, segments);
   }
 
   if (['go', 'jail', 'parking', 'chest', 'chance'].includes(square.type)) {
     segments.push(await msg('sFREE', 'משבצת זו אינה דורשת פעולה'));
     player.lastSeenSeq = game.logSeq;
     await saveGame(game.code, game);
-    res.status(200).send(
-      respond(segments, { readParams: menuReadParams({ name: 'ACTION', allowed: '1234' }) })
-    );
-    return;
+    return sendActionMenu(res, flow, saveFlow, segments);
   }
 
   // property / railroad / utility
@@ -684,30 +758,21 @@ async function resolveSquare(res, game, player, square, segments) {
     player.lastSeenSeq = game.logSeq;
     await saveGame(game.code, game);
     const t = await msg('sBUY', `הנכס ${square.name} פנוי לקנייה במחיר ${priceText(square.price)}. לקנייה הקישו אחת. לוותר הקישו שתיים`);
-    res.status(200).send(
-      respond([...segments, t], { readParams: menuReadParams({ name: 'BUYCHOICE', allowed: '12' }) })
-    );
-    return;
+    return sendBuyMenu(res, flow, saveFlow, [...segments, t]);
   }
 
   if (owner === player.id) {
     segments.push(await msg('sOWN', 'זהו נכס שלכם'));
     player.lastSeenSeq = game.logSeq;
     await saveGame(game.code, game);
-    res.status(200).send(
-      respond(segments, { readParams: menuReadParams({ name: 'ACTION', allowed: '1234' }) })
-    );
-    return;
+    return sendActionMenu(res, flow, saveFlow, segments);
   }
 
   if (game.mortgaged[square.i]) {
     segments.push(await msg('sMORTG', 'הנכס ממושכן ולא נגבית עליו שכירות'));
     player.lastSeenSeq = game.logSeq;
     await saveGame(game.code, game);
-    res.status(200).send(
-      respond(segments, { readParams: menuReadParams({ name: 'ACTION', allowed: '1234' }) })
-    );
-    return;
+    return sendActionMenu(res, flow, saveFlow, segments);
   }
 
   const houses = game.houses[square.i] || 0;
@@ -733,10 +798,10 @@ async function resolveSquare(res, game, player, square, segments) {
   await broadcastLog(game, `${player.name} שילם שכירות ${rent} שקלים ל${ownerPlayer ? ownerPlayer.name : 'שחקן'} עבור ${square.name}`);
   segments.push(await msg('sRENT', `שילמתם שכירות בסך ${priceText(rent)} לבעל הנכס`));
 
-  return checkBankruptcyThenContinue(res, game, player, segments);
+  return checkBankruptcyThenContinue(res, flow, saveFlow, game, player, segments);
 }
 
-async function checkBankruptcyThenContinue(res, game, player, segments) {
+async function checkBankruptcyThenContinue(res, flow, saveFlow, game, player, segments) {
   if (player.money < 0) liquidateIfNeeded(game, player);
 
   if (player.money < 0) {
@@ -764,9 +829,7 @@ async function checkBankruptcyThenContinue(res, game, player, segments) {
 
   player.lastSeenSeq = game.logSeq;
   await saveGame(game.code, game);
-  res.status(200).send(
-    respond(segments, { readParams: menuReadParams({ name: 'ACTION', allowed: '1234' }) })
-  );
+  return sendActionMenu(res, flow, saveFlow, segments);
 }
 
 function liquidateIfNeeded(game, player) {
@@ -783,7 +846,7 @@ function liquidateIfNeeded(game, player) {
   }
 }
 
-async function handleBuyDecision(res, game, player, action) {
+async function handleBuyDecision(res, flow, saveFlow, game, player, action) {
   const sqIndex = game.pendingBuy;
   const square = squareAt(sqIndex);
   game.pendingBuy = null;
@@ -793,10 +856,7 @@ async function handleBuyDecision(res, game, player, action) {
       const t = await msg('sNOMONEY', 'אין לכם מספיק כסף לקנות נכס זה');
       player.lastSeenSeq = game.logSeq;
       await saveGame(game.code, game);
-      res.status(200).send(
-        respond([t], { readParams: menuReadParams({ name: 'ACTION', allowed: '1234' }) })
-      );
-      return;
+      return sendActionMenu(res, flow, saveFlow, [t]);
     }
     player.money -= square.price;
     game.owners[sqIndex] = player.id;
@@ -804,34 +864,27 @@ async function handleBuyDecision(res, game, player, action) {
     const t = await msg('sBOUGHT', `קניתם את ${square.name} תמורת ${priceText(square.price)}`);
     player.lastSeenSeq = game.logSeq;
     await saveGame(game.code, game);
-    res.status(200).send(
-      respond([t], { readParams: menuReadParams({ name: 'ACTION', allowed: '1234' }) })
-    );
-    return;
+    return sendActionMenu(res, flow, saveFlow, [t]);
   }
 
   await broadcastLog(game, `${player.name} ויתר על קניית ${square.name}`);
   const t = await msg('sSKIP', 'ויתרתם על קניית הנכס');
   player.lastSeenSeq = game.logSeq;
   await saveGame(game.code, game);
-  res.status(200).send(
-    respond([t], { readParams: menuReadParams({ name: 'ACTION', allowed: '1234' }) })
-  );
+  return sendActionMenu(res, flow, saveFlow, [t]);
 }
 
-async function announcePersonalStatus(res, game, player) {
+async function announcePersonalStatus(res, flow, saveFlow, game, player) {
   const owned = Object.keys(game.owners)
     .filter((k) => game.owners[k] === player.id)
     .map((k) => squareAt(Number(k)).name);
   const propsText = owned.length ? owned.join(', ') : 'אין נכסים';
   const t1 = await msg('sSTATUS1', `יש לכם ${player.money} שקלים`);
   const t2 = await msg('sSTATUS2', `הנכסים שלכם הם: ${propsText}`);
-  res.status(200).send(
-    respond([t1, t2], { readParams: menuReadParams({ name: 'ACTION', allowed: '1234' }) })
-  );
+  return sendActionMenu(res, flow, saveFlow, [t1, t2]);
 }
 
-async function handleBuildHouses(res, game, player) {
+async function handleBuildHouses(res, flow, saveFlow, game, player) {
   const owned = Object.keys(game.owners).filter((k) => game.owners[k] === player.id);
   const buildable = owned
     .map((k) => Number(k))
@@ -842,10 +895,7 @@ async function handleBuildHouses(res, game, player) {
 
   if (buildable.length === 0) {
     const t = await msg('sNOBUILD', 'אין לכם כרגע נכסים זמינים לבנייה. יש צורך במונופול על קבוצת צבע שלמה');
-    res.status(200).send(
-      respond([t], { readParams: menuReadParams({ name: 'ACTION', allowed: '1234' }) })
-    );
-    return;
+    return sendActionMenu(res, flow, saveFlow, [t]);
   }
 
   const sqIndex = buildable[0];
@@ -853,10 +903,7 @@ async function handleBuildHouses(res, game, player) {
   const cost = square.houseCost || board.houseCostByGroup[square.group] || 50;
   if (player.money < cost) {
     const t = await msg('sNOMONEYBUILD', 'אין לכם מספיק כסף לבנייה');
-    res.status(200).send(
-      respond([t], { readParams: menuReadParams({ name: 'ACTION', allowed: '1234' }) })
-    );
-    return;
+    return sendActionMenu(res, flow, saveFlow, [t]);
   }
   player.money -= cost;
   game.houses[sqIndex] = (game.houses[sqIndex] || 0) + 1;
@@ -866,21 +913,16 @@ async function handleBuildHouses(res, game, player) {
   const t = await msg('sBUILT', `בניתם על ${square.name}. עלות ${priceText(cost)}. כעת יש שם ${levelText}`);
   player.lastSeenSeq = game.logSeq;
   await saveGame(game.code, game);
-  res.status(200).send(
-    respond([t], { readParams: menuReadParams({ name: 'ACTION', allowed: '1234' }) })
-  );
+  return sendActionMenu(res, flow, saveFlow, [t]);
 }
 
-async function endTurn(res, game, player) {
+async function endTurn(res, flow, saveFlow, game, player) {
   if (player.doublesStreak > 0 && !player.inJail) {
     player.doublesStreak = 0;
     player.lastSeenSeq = game.logSeq;
     await saveGame(game.code, game);
     const t = await msg('sAGAIN', 'הטלתם דאבל, אתם משחקים שוב');
-    res.status(200).send(
-      respond([t], { readParams: menuReadParams({ name: 'ACTION', allowed: '1234' }) })
-    );
-    return;
+    return sendActionMenu(res, flow, saveFlow, [t]);
   }
 
   let next = (game.turn + 1) % game.players.length;
@@ -896,5 +938,9 @@ async function endTurn(res, game, player) {
 
   const t = await msg('sENDTURN', `סיימתם את תורכם. התור עובר ל${nextPlayer.name}`);
   // The player who just finished waits (hold music) until their next turn.
-  res.status(200).send(respond([t], { wait: true }));
+  const pName = nextParamName(flow);
+  flow.expect = pName;
+  flow.expectKind = 'poll';
+  await saveFlow(flow);
+  res.status(200).send(respond([t], { wait: true, waitParamName: pName }));
 }
