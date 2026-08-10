@@ -221,7 +221,7 @@ module.exports = async (req, res) => {
       await rSet(flowKey, JSON.stringify(flow), 3600);
       const welcome = await msg('s1000', 'ברוכים הבאים למונופול הטלפוני. להתחלת משחק חדש הקישו אחת. להצטרפות למשחק קיים הקישו שתיים');
       res.status(200).send(
-        respond([welcome], `read=t-=CHOICE,,1,1,10,Number,yes,no,,,12`)
+        respond([welcome], `read=noop-x=CHOICE,,1,1,10,Number,yes,no,,,12`)
       );
       return;
     }
@@ -233,14 +233,14 @@ module.exports = async (req, res) => {
         flow = { step: 'ask_player_count' };
         await rSet(flowKey, JSON.stringify(flow), 3600);
         const t = await msg('s1001', 'כמה שחקנים ישתתפו במשחק? הקישו מספר בין שתיים לשש');
-        res.status(200).send(respond([t], `read=t-=PCOUNT,,1,1,10,Number,yes,no,,2.3.4.5.6`));
+        res.status(200).send(respond([t], `read=noop-x=PCOUNT,,1,1,10,Number,yes,no,,2.3.4.5.6`));
         return;
       }
       if (choice === '2') {
         flow = { step: 'ask_join_code' };
         await rSet(flowKey, JSON.stringify(flow), 3600);
         const t = await msg('s1002', 'הקישו את קוד המשחק בן שלוש הספרות');
-        res.status(200).send(respond([t], `read=t-=JOINCODE,,3,3,10,Digits,yes,no`));
+        res.status(200).send(respond([t], `read=noop-x=JOINCODE,,3,3,10,Digits,yes,no`));
         return;
       }
       const err = await msg('s1003', 'בחירה לא חוקית');
@@ -273,7 +273,7 @@ module.exports = async (req, res) => {
       const codeDigits = `d-${code}`;
       const t2 = await msg('s1006', 'שמרו את הקוד הזה ומסרו אותו לשאר השחקנים כדי שיוכלו להצטרף. כעת הקלידו את שמכם באמצעות המקלדת ולאחר מכן הקישו סולמית');
       res.status(200).send(
-        respond([t1, codeDigits, t2], `read=t-=PNAME,,HebrewKeyboard,,,,,no`)
+        respond([t1, codeDigits, t2], `read=noop-x=PNAME,,HebrewKeyboard`)
       );
       return;
     }
@@ -300,7 +300,7 @@ module.exports = async (req, res) => {
       flow = { step: 'ask_name_join', code };
       await rSet(flowKey, JSON.stringify(flow), 3600);
       const t = await msg('s1010', 'הקלידו את שמכם באמצעות המקלדת ולאחר מכן הקישו סולמית');
-      res.status(200).send(respond([t], `read=t-=PNAME,,HebrewKeyboard,,,,,no`));
+      res.status(200).send(respond([t], `read=noop-x=PNAME,,HebrewKeyboard`));
       return;
     }
 
@@ -338,7 +338,7 @@ module.exports = async (req, res) => {
       const t1 = await msg('s1012', `נרשמת למשחק בהצלחה ${name}. יש לכם ${board.startMoney} שקלים`);
       if (!readyToStart) {
         const t2 = await msg('s1013', 'ממתינים לשאר השחקנים להצטרף. אנא המתינו על הקו');
-        res.status(200).send(respond([t1, t2], `read=t-=WAITPOLL,,1,1,5,Number,yes,Ok`));
+        res.status(200).send(respond([t1, t2], `read=noop-x=WAITPOLL,,1,1,5,Number,yes,Ok`));
         return;
       }
       const t2 = await msg('s1014', 'כל השחקנים הצטרפו. המשחק מתחיל');
@@ -364,7 +364,7 @@ module.exports = async (req, res) => {
 
       if (!game.started) {
         const t = await msg('s1013', 'ממתינים לשאר השחקנים להצטרף. אנא המתינו על הקו');
-        res.status(200).send(respond([t], `read=t-=WAITPOLL,,1,1,5,Number,yes,Ok`));
+        res.status(200).send(respond([t], `read=noop-x=WAITPOLL,,1,1,5,Number,yes,Ok`));
         return;
       }
 
@@ -391,9 +391,9 @@ module.exports = async (req, res) => {
 function turnMenuAction(game, listeningPlayerId) {
   const active = currentPlayer(game);
   if (active.id === listeningPlayerId) {
-    return `read=t-=ACTION,,1,1,15,Number,yes,Ok`;
+    return `read=noop-x=ACTION,,1,1,15,Number,yes,Ok`;
   }
-  return `read=t-=ACTION,,1,1,15,Number,yes,Ok`;
+  return `read=noop-x=ACTION,,1,1,15,Number,yes,Ok`;
 }
 
 async function handleInGameAction(req, res, game, player, params) {
@@ -406,7 +406,7 @@ async function handleInGameAction(req, res, game, player, params) {
     const t = line
       ? await msg('sTURNLOG_' + game.log.length, line)
       : await msg('s1016', 'ממתינים לתור שלכם');
-    res.status(200).send(respond([t], `read=t-=ACTION,,1,1,8,Number,yes,Ok`));
+    res.status(200).send(respond([t], `read=noop-x=ACTION,,1,1,8,Number,yes,Ok`));
     return;
   }
 
@@ -442,7 +442,7 @@ async function sendTurnOptions(res, game, player, prefixSegments) {
   const t1 = await msg('s1018', `זהו תורך ${player.name}. יש לכם ${player.money} שקלים`);
   const t2 = await msg('s1019', 'להטלת קוביות הקישו אחת. לשמיעת מצב אישי הקישו שתיים. לבניית בתים הקישו שלוש. לסיום התור הקישו ארבע');
   await saveGame(game.code, game);
-  res.status(200).send(respond([...prefixSegments, t1, t2], `read=t-=ACTION,,1,1,15,Number,yes,Ok`));
+  res.status(200).send(respond([...prefixSegments, t1, t2], `read=noop-x=ACTION,,1,1,15,Number,yes,Ok`));
 }
 
 async function broadcastLog(game, text) {
@@ -471,7 +471,7 @@ async function rollDiceAndMove(res, game, player) {
         await broadcastLog(game, `${player.name} נשאר בכלא (לא יצא דאבל)`);
         await saveGame(game.code, game);
         const t = await msg('s1020', `הטלתם ${d1} ו${d2}. נשארתם בכלא`);
-        res.status(200).send(respond([t], `read=t-=ACTION,,1,1,15,Number,yes,Ok`));
+        res.status(200).send(respond([t], `read=noop-x=ACTION,,1,1,15,Number,yes,Ok`));
         return;
       }
     }
@@ -485,7 +485,7 @@ async function rollDiceAndMove(res, game, player) {
       await broadcastLog(game, `${player.name} הטיל דאבל שלוש פעמים ברציפות ונשלח לכלא`);
       await saveGame(game.code, game);
       const t = await msg('s1021', 'שלוש פעמים דאבל ברציפות. אתם נשלחים לכלא');
-      res.status(200).send(respond([t], `read=t-=ACTION,,1,1,15,Number,yes,Ok`));
+      res.status(200).send(respond([t], `read=noop-x=ACTION,,1,1,15,Number,yes,Ok`));
       return;
     }
   } else {
@@ -524,7 +524,7 @@ async function resolveSquare(res, game, player, square, segments) {
     sendToJail(player);
     segments.push(await msg('s1023', 'נחתתם על לך לכלא. אתם נשלחים לכלא'));
     await saveGame(game.code, game);
-    res.status(200).send(respond(segments, `read=t-=ACTION,,1,1,15,Number,yes,Ok`));
+    res.status(200).send(respond(segments, `read=noop-x=ACTION,,1,1,15,Number,yes,Ok`));
     return;
   }
 
@@ -538,7 +538,7 @@ async function resolveSquare(res, game, player, square, segments) {
   if (square.type === 'go' || square.type === 'jail' || square.type === 'parking' || square.type === 'chest' || square.type === 'chance') {
     segments.push(await msg('sFREE', 'משבצת זו אינה דורשת פעולה'));
     await saveGame(game.code, game);
-    res.status(200).send(respond(segments, `read=t-=ACTION,,1,1,15,Number,yes,Ok`));
+    res.status(200).send(respond(segments, `read=noop-x=ACTION,,1,1,15,Number,yes,Ok`));
     return;
   }
 
@@ -549,21 +549,21 @@ async function resolveSquare(res, game, player, square, segments) {
     game.pendingBuy = square.i;
     await saveGame(game.code, game);
     const t = await msg('sBUY', `הנכס ${square.name} פנוי לקנייה במחיר ${priceText(square.price)}. לקנייה הקישו אחת. לוותר הקישו שתיים`);
-    res.status(200).send(respond([...segments, t], `read=t-=BUYCHOICE,,1,1,15,Number,yes,Ok`));
+    res.status(200).send(respond([...segments, t], `read=noop-x=BUYCHOICE,,1,1,15,Number,yes,Ok`));
     return;
   }
 
   if (owner === player.id) {
     segments.push(await msg('sOWN', 'זהו נכס שלכם'));
     await saveGame(game.code, game);
-    res.status(200).send(respond(segments, `read=t-=ACTION,,1,1,15,Number,yes,Ok`));
+    res.status(200).send(respond(segments, `read=noop-x=ACTION,,1,1,15,Number,yes,Ok`));
     return;
   }
 
   if (game.mortgaged[square.i]) {
     segments.push(await msg('sMORTG', 'הנכס ממושכן ולא נגבית עליו שכירות'));
     await saveGame(game.code, game);
-    res.status(200).send(respond(segments, `read=t-=ACTION,,1,1,15,Number,yes,Ok`));
+    res.status(200).send(respond(segments, `read=noop-x=ACTION,,1,1,15,Number,yes,Ok`));
     return;
   }
 
@@ -624,7 +624,7 @@ async function checkBankruptcyThenContinue(res, game, player, segments) {
   }
 
   await saveGame(game.code, game);
-  res.status(200).send(respond(segments, `read=t-=ACTION,,1,1,15,Number,yes,Ok`));
+  res.status(200).send(respond(segments, `read=noop-x=ACTION,,1,1,15,Number,yes,Ok`));
 }
 
 function liquidateIfNeeded(game, player) {
@@ -650,7 +650,7 @@ async function handleBuyDecision(res, game, player, action) {
     if (player.money < square.price) {
       const t = await msg('sNOMONEY', 'אין לכם מספיק כסף לקנות נכס זה');
       await saveGame(game.code, game);
-      res.status(200).send(respond([t], `read=t-=ACTION,,1,1,15,Number,yes,Ok`));
+      res.status(200).send(respond([t], `read=noop-x=ACTION,,1,1,15,Number,yes,Ok`));
       return;
     }
     player.money -= square.price;
@@ -658,14 +658,14 @@ async function handleBuyDecision(res, game, player, action) {
     await broadcastLog(game, `${player.name} קנה את ${square.name}. עלות ${square.price} שקלים`);
     const t = await msg('sBOUGHT', `קניתם את ${square.name} תמורת ${priceText(square.price)}`);
     await saveGame(game.code, game);
-    res.status(200).send(respond([t], `read=t-=ACTION,,1,1,15,Number,yes,Ok`));
+    res.status(200).send(respond([t], `read=noop-x=ACTION,,1,1,15,Number,yes,Ok`));
     return;
   }
 
   await broadcastLog(game, `${player.name} ויתר על קניית ${square.name}`);
   const t = await msg('sSKIP', 'ויתרתם על קניית הנכס');
   await saveGame(game.code, game);
-  res.status(200).send(respond([t], `read=t-=ACTION,,1,1,15,Number,yes,Ok`));
+  res.status(200).send(respond([t], `read=noop-x=ACTION,,1,1,15,Number,yes,Ok`));
 }
 
 async function announcePersonalStatus(res, game, player) {
@@ -675,7 +675,7 @@ async function announcePersonalStatus(res, game, player) {
   const propsText = owned.length ? owned.join(', ') : 'אין נכסים';
   const t1 = await msg('sSTATUS1', `יש לכם ${player.money} שקלים`);
   const t2 = await msg('sSTATUS2', `הנכסים שלכם הם: ${propsText}`);
-  res.status(200).send(respond([t1, t2], `read=t-=ACTION,,1,1,15,Number,yes,Ok`));
+  res.status(200).send(respond([t1, t2], `read=noop-x=ACTION,,1,1,15,Number,yes,Ok`));
 }
 
 async function handleBuildHouses(res, game, player) {
@@ -689,7 +689,7 @@ async function handleBuildHouses(res, game, player) {
 
   if (buildable.length === 0) {
     const t = await msg('sNOBUILD', 'אין לכם כרגע נכסים זמינים לבנייה. יש צורך במונופול על קבוצת צבע שלמה');
-    res.status(200).send(respond([t], `read=t-=ACTION,,1,1,15,Number,yes,Ok`));
+    res.status(200).send(respond([t], `read=noop-x=ACTION,,1,1,15,Number,yes,Ok`));
     return;
   }
 
@@ -699,7 +699,7 @@ async function handleBuildHouses(res, game, player) {
   const cost = square.houseCost || board.houseCostByGroup[square.group] || 50;
   if (player.money < cost) {
     const t = await msg('sNOMONEYBUILD', 'אין לכם מספיק כסף לבנייה');
-    res.status(200).send(respond([t], `read=t-=ACTION,,1,1,15,Number,yes,Ok`));
+    res.status(200).send(respond([t], `read=noop-x=ACTION,,1,1,15,Number,yes,Ok`));
     return;
   }
   player.money -= cost;
@@ -709,7 +709,7 @@ async function handleBuildHouses(res, game, player) {
   await broadcastLog(game, `${player.name} בנה על ${square.name}, כעת יש ${levelText}`);
   const t = await msg('sBUILT', `בניתם על ${square.name}. עלות ${priceText(cost)}. כעת יש שם ${levelText}`);
   await saveGame(game.code, game);
-  res.status(200).send(respond([t], `read=t-=ACTION,,1,1,15,Number,yes,Ok`));
+  res.status(200).send(respond([t], `read=noop-x=ACTION,,1,1,15,Number,yes,Ok`));
 }
 
 async function endTurn(res, game, player) {
@@ -718,7 +718,7 @@ async function endTurn(res, game, player) {
     player.doublesStreak = 0; // reset streak marker for the extra turn bookkeeping
     await saveGame(game.code, game);
     const t = await msg('sAGAIN', 'הטלתם דאבל, אתם משחקים שוב');
-    res.status(200).send(respond([t], `read=t-=ACTION,,1,1,15,Number,yes,Ok`));
+    res.status(200).send(respond([t], `read=noop-x=ACTION,,1,1,15,Number,yes,Ok`));
     return;
   }
 
@@ -732,5 +732,5 @@ async function endTurn(res, game, player) {
   await saveGame(game.code, game);
 
   const t = await msg('sENDTURN', `סיימתם את תורכם. התור עובר ל${nextPlayer.name}`);
-  res.status(200).send(respond([t], `read=t-=ACTION,,1,1,15,Number,yes,Ok`));
+  res.status(200).send(respond([t], `read=noop-x=ACTION,,1,1,15,Number,yes,Ok`));
 }
