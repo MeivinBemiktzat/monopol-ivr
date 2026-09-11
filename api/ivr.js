@@ -299,6 +299,28 @@ function priceText(n) {
   return `${n} שקלים`;
 }
 
+// Hebrew names for the property color groups, so we can announce the color of
+// every city the player lands on / buys (feature request א).
+const GROUP_NAMES_HE = {
+  brown: 'חום',
+  lightblue: 'תכלת',
+  pink: 'ורוד',
+  orange: 'כתום',
+  red: 'אדום',
+  yellow: 'צהוב',
+  green: 'ירוק',
+  blue: 'כחול',
+};
+
+// Returns a short "מקבוצת הצבע <color>" phrase for a property square, or ''
+// for squares that have no color group (railroads, utilities, etc.).
+function colorPhrase(square) {
+  if (square && square.type === 'property' && GROUP_NAMES_HE[square.group]) {
+    return `מקבוצת הצבע ${GROUP_NAMES_HE[square.group]}`;
+  }
+  return '';
+}
+
 function squareAt(i) {
   return board.squares[i % board.squares.length];
 }
@@ -496,6 +518,8 @@ module.exports = async (req, res) => {
         inJail: false,
         jailTurns: 0,
         doublesStreak: 0,
+        hasRolled: false, // did this player already roll the dice this turn?
+        extraRoll: false, // did they earn another roll (doubles) this turn?
         bankrupt: false,
         lastSeenSeq: 0,
       };
@@ -638,18 +662,34 @@ async function sendBuyMenu(res, flow, saveFlow, segments) {
   );
 }
 
+// Sends `segments` and arms a BUILD menu. `count` = how many properties are
+// offered (digits 1..count), plus 0 to cancel. Uses a fresh read parameter
+// name. `allowed` restricts the accepted digits so mis-keys re-prompt.
+async function sendBuildMenu(res, flow, saveFlow, segments, count) {
+  const pName = nextParamName(flow);
+  flow.expect = pName;
+  flow.expectKind = 'build';
+  await saveFlow(flow);
+  // Offered digits: 0 (cancel) + 1..count. count is capped at 9 by the caller.
+  const allowed = '0' + Array.from({ length: count }, (_, i) => String(i + 1)).join('');
+  res.status(200).send(
+    respond(segments, { readParams: menuReadParams({ name: pName, allowed }) })
+  );
+}
+
 async function handleInGameAction(res, flow, saveFlow, game, player, params) {
   const expectKind = flow.expectKind;
   const value = flow.expect ? params[flow.expect] : undefined;
   const action = expectKind === 'action' ? value : undefined;
   const buyChoice = expectKind === 'buy' ? value : undefined;
+  const buildChoice = expectKind === 'build' ? value : undefined;
 
   // Coming back from a hold-music wait, or with no usable value at all —
   // just re-evaluate state: announce anything new, resume waiting or show
   // the turn menu. We key off `expectKind`/the exact param name we asked
   // for last time, never a fixed name, so a stale accumulated value from
   // earlier in the call can never be misread as a fresh answer.
-  if (action === undefined && buyChoice === undefined) {
+  if (action === undefined && buyChoice === undefined && buildChoice === undefined) {
     return sendGameState(res, flow, saveFlow, game, player, []);
   }
 
@@ -665,6 +705,10 @@ async function handleInGameAction(res, flow, saveFlow, game, player, params) {
     return handleBuyDecision(res, flow, saveFlow, game, player, buyChoice);
   }
 
+  if (expectKind === 'build' && buildChoice !== undefined) {
+    return handleBuildChoice(res, flow, saveFlow, game, player, buildChoice);
+  }
+
   if (action === '1') return rollDiceAndMove(res, flow, saveFlow, game, player);
   if (action === '2') return announcePersonalStatus(res, flow, saveFlow, game, player);
   if (action === '3') return handleBuildHouses(res, flow, saveFlow, game, player);
@@ -676,15 +720,54 @@ async function handleInGameAction(res, flow, saveFlow, game, player, params) {
 }
 
 async function rollDiceAndMove(res, flow, saveFlow, game, player) {
+  // ---- Single-roll-per-turn guard (fixes bugs ב + ד) ---------------------
+  // The turn does NOT advance automatically after a roll: it only advances
+  // when the active player presses 4 ("end turn"). Without this guard, the
+  // action menu simply reappears after every roll, letting the SAME player
+  // press 1 and roll again and again in one turn — effectively "stealing"
+  // extra turns/moves (bug ב), which also looks like the game handed out an
+  // undeserved bonus roll as if a double had been rolled even on an ordinary
+  // total such as 5 (bug ד). A player may roll again ONLY when they earned it
+  // by rolling a double (player.extraRoll). Otherwise they must build / check
+  // status / end the turn.
+  if (player.hasRolled && !player.extraRoll) {
+    const t = await msg(
+      's1024',
+      'כבר הטלתם קוביות בתור זה. לבניית בתים הקישו שלוש, לסיום התור הקישו ארבע'
+    );
+    return sendActionMenu(res, flow, saveFlow, [t]);
+  }
+
   const d1 = 1 + Math.floor(Math.random() * 6);
   const d2 = 1 + Math.floor(Math.random() * 6);
   const isDouble = d1 === d2;
+
+  player.hasRolled = true;
+  // Consume any previously-earned bonus roll; a fresh one is granted below
+  // only if THIS roll is itself a (qualifying) double.
+  player.extraRoll = false;
 
   if (player.inJail) {
     if (isDouble) {
       player.inJail = false;
       player.jailTurns = 0;
+      player.doublesStreak = 0;
       await broadcastLog(game, `${player.name} הטיל דאבל ויצא מהכלא`);
+      // Leaving jail with a double lets you MOVE, but (per Monopoly rules)
+      // does NOT grant another roll — so we deliberately do not set extraRoll
+      // and skip the doubles-streak bonus logic below by returning early
+      // after movement.
+      const steps = d1 + d2;
+      const oldPos = player.pos;
+      player.pos = (player.pos + steps) % board.squares.length;
+      const passedGo = player.pos <= oldPos;
+      if (passedGo) player.money += board.goMoney;
+      const square = squareAt(player.pos);
+      await broadcastLog(game, `${player.name} הטיל ${d1} ו${d2} ונחת על ${square.name}`);
+      const diceMsg = await msg('sDICE', `הטלתם ${d1} ו${d2}. נחתתם על ${square.name}`);
+      const segs = [diceMsg];
+      if (passedGo) segs.push(await msg('s1022', `עברתם בהתחלה וקיבלתם ${board.goMoney} שקלים`));
+      return resolveSquare(res, flow, saveFlow, game, player, square, segs);
     } else {
       player.jailTurns += 1;
       if (player.jailTurns >= 3) {
@@ -713,6 +796,8 @@ async function rollDiceAndMove(res, flow, saveFlow, game, player) {
       const t = await msg('s1021', 'שלוש פעמים דאבל ברציפות. אתם נשלחים לכלא');
       return sendActionMenu(res, flow, saveFlow, [t]);
     }
+    // A genuine double (and not the 3rd) earns exactly one more roll.
+    player.extraRoll = true;
   } else {
     player.doublesStreak = 0;
   }
@@ -768,7 +853,8 @@ async function resolveSquare(res, flow, saveFlow, game, player, square, segments
     game.pendingBuy = square.i;
     player.lastSeenSeq = game.logSeq;
     await saveGame(game.code, game);
-    const t = await msg('sBUY', `הנכס ${square.name} פנוי לקנייה במחיר ${priceText(square.price)}. לקנייה הקישו אחת. לוותר הקישו שתיים`);
+    const color = colorPhrase(square);
+    const t = await msg('sBUY', `הנכס ${square.name} ${color} פנוי לקנייה במחיר ${priceText(square.price)}. לקנייה הקישו אחת. לוותר הקישו שתיים`);
     return sendBuyMenu(res, flow, saveFlow, [...segments, t]);
   }
 
@@ -871,8 +957,9 @@ async function handleBuyDecision(res, flow, saveFlow, game, player, action) {
     }
     player.money -= square.price;
     game.owners[sqIndex] = player.id;
-    await broadcastLog(game, `${player.name} קנה את ${square.name}. עלות ${square.price} שקלים`);
-    const t = await msg('sBOUGHT', `קניתם את ${square.name} תמורת ${priceText(square.price)}`);
+    const color = colorPhrase(square);
+    await broadcastLog(game, `${player.name} קנה את ${square.name} ${color}. עלות ${square.price} שקלים`);
+    const t = await msg('sBOUGHT', `קניתם את ${square.name} ${color} תמורת ${priceText(square.price)}`);
     player.lastSeenSeq = game.logSeq;
     await saveGame(game.code, game);
     return sendActionMenu(res, flow, saveFlow, [t]);
@@ -895,31 +982,104 @@ async function announcePersonalStatus(res, flow, saveFlow, game, player) {
   return sendActionMenu(res, flow, saveFlow, [t1, t2]);
 }
 
-async function handleBuildHouses(res, flow, saveFlow, game, player) {
-  const owned = Object.keys(game.owners).filter((k) => game.owners[k] === player.id);
-  const buildable = owned
+// Returns the list of square indices this player may currently build on
+// (owns the full color group, fewer than 5 houses/hotel), sorted by board
+// position for a stable, predictable spoken order.
+function buildableSquares(game, playerId) {
+  return Object.keys(game.owners)
+    .filter((k) => game.owners[k] === playerId)
     .map((k) => Number(k))
     .filter((i) => {
       const sq = squareAt(i);
-      return sq.type === 'property' && ownsFullGroup(game, player.id, sq.group) && (game.houses[i] || 0) < 5;
-    });
+      return sq.type === 'property' && ownsFullGroup(game, playerId, sq.group) && (game.houses[i] || 0) < 5;
+    })
+    .sort((a, b) => a - b);
+}
+
+// Cost to add one house/hotel on a given square.
+function houseCostFor(square) {
+  return square.houseCost || board.houseCostByGroup[square.group] || 50;
+}
+
+// Feature ג: instead of auto-building on the first eligible property, present
+// the player with the list of buildable properties (with color, current level
+// and cost) and let them choose WHERE to build.
+async function handleBuildHouses(res, flow, saveFlow, game, player) {
+  const buildable = buildableSquares(game, player.id);
 
   if (buildable.length === 0) {
     const t = await msg('sNOBUILD', 'אין לכם כרגע נכסים זמינים לבנייה. יש צורך במונופול על קבוצת צבע שלמה');
     return sendActionMenu(res, flow, saveFlow, [t]);
   }
 
-  const sqIndex = buildable[0];
+  // Menus can offer at most 9 numbered options (single digit choice 1-9).
+  const offered = buildable.slice(0, 9);
+  flow.buildOptions = offered; // remember index->square mapping for the reply
+  await saveFlow(flow);
+
+  const segments = [await msg('sBUILDMENU', 'בחרו היכן לבנות')];
+  for (let idx = 0; idx < offered.length; idx++) {
+    const sqIndex = offered[idx];
+    const square = squareAt(sqIndex);
+    const level = game.houses[sqIndex] || 0;
+    const levelText = level === 0 ? 'ללא בתים' : `${level} בתים`;
+    const cost = houseCostFor(square);
+    const color = colorPhrase(square);
+    segments.push(
+      await msg(
+        `sBUILDOPT_${idx + 1}`,
+        `להוספת בית ב${square.name} ${color}, כרגע ${levelText}, בעלות ${priceText(cost)}, הקישו ${idx + 1}`
+      )
+    );
+  }
+  segments.push(await msg('sBUILDCANCEL', 'לביטול הקישו אפס'));
+
+  return sendBuildMenu(res, flow, saveFlow, segments, offered.length);
+}
+
+// Handles the digit the player pressed in the build menu.
+async function handleBuildChoice(res, flow, saveFlow, game, player, choice) {
+  const options = flow.buildOptions || [];
+
+  if (choice === '0') {
+    flow.buildOptions = null;
+    await saveFlow(flow);
+    const t = await msg('sBUILDCANCELED', 'ביטלתם את הבנייה');
+    return sendActionMenu(res, flow, saveFlow, [t]);
+  }
+
+  const pick = parseInt(choice, 10);
+  if (!pick || pick < 1 || pick > options.length) {
+    // Out-of-range: re-show the menu rather than silently ignoring.
+    return handleBuildHouses(res, flow, saveFlow, game, player);
+  }
+
+  const sqIndex = options[pick - 1];
   const square = squareAt(sqIndex);
-  const cost = square.houseCost || board.houseCostByGroup[square.group] || 50;
+
+  // Re-validate against live state (money may have changed, or the property
+  // may no longer be eligible if something shifted since the menu was built).
+  const stillBuildable = buildableSquares(game, player.id).includes(sqIndex);
+  if (!stillBuildable) {
+    flow.buildOptions = null;
+    await saveFlow(flow);
+    const t = await msg('sNOBUILD', 'אין לכם כרגע נכסים זמינים לבנייה. יש צורך במונופול על קבוצת צבע שלמה');
+    return sendActionMenu(res, flow, saveFlow, [t]);
+  }
+
+  const cost = houseCostFor(square);
   if (player.money < cost) {
+    flow.buildOptions = null;
+    await saveFlow(flow);
     const t = await msg('sNOMONEYBUILD', 'אין לכם מספיק כסף לבנייה');
     return sendActionMenu(res, flow, saveFlow, [t]);
   }
+
   player.money -= cost;
   game.houses[sqIndex] = (game.houses[sqIndex] || 0) + 1;
   const level = game.houses[sqIndex];
   const levelText = level >= 5 ? 'מלון' : `${level} בתים`;
+  flow.buildOptions = null;
   await broadcastLog(game, `${player.name} בנה על ${square.name}, כעת יש ${levelText}`);
   const t = await msg('sBUILT', `בניתם על ${square.name}. עלות ${priceText(cost)}. כעת יש שם ${levelText}`);
   player.lastSeenSeq = game.logSeq;
@@ -928,13 +1088,21 @@ async function handleBuildHouses(res, flow, saveFlow, game, player) {
 }
 
 async function endTurn(res, flow, saveFlow, game, player) {
-  if (player.doublesStreak > 0 && !player.inJail) {
-    player.doublesStreak = 0;
+  // Earned another roll by rolling a double this turn: stay on the same turn
+  // and let the player roll again, rather than passing the turn along.
+  if (player.extraRoll && !player.inJail) {
+    player.extraRoll = false;
+    player.hasRolled = false; // allow the bonus roll
     player.lastSeenSeq = game.logSeq;
     await saveGame(game.code, game);
-    const t = await msg('sAGAIN', 'הטלתם דאבל, אתם משחקים שוב');
+    const t = await msg('sAGAIN', 'הטלתם דאבל, אתם משחקים שוב. להטלת קוביות הקישו אחת');
     return sendActionMenu(res, flow, saveFlow, [t]);
   }
+
+  // Turn is over for this player — clear their per-turn state.
+  player.hasRolled = false;
+  player.extraRoll = false;
+  player.doublesStreak = 0;
 
   let next = (game.turn + 1) % game.players.length;
   while (game.players[next].bankrupt) {
@@ -942,6 +1110,10 @@ async function endTurn(res, flow, saveFlow, game, player) {
   }
   game.turn = next;
   const nextPlayer = game.players[next];
+  // Give the incoming player a clean turn slate.
+  nextPlayer.hasRolled = false;
+  nextPlayer.extraRoll = false;
+  nextPlayer.doublesStreak = 0;
   await broadcastLog(game, `עובר תור ל${nextPlayer.name}`);
 
   player.lastSeenSeq = game.logSeq;
