@@ -34,6 +34,7 @@
 // ============================================================================
 
 const board = require('./board.json');
+const cards = require('./cards.json');
 
 // ---- Config from environment -----------------------------------------------
 const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL;
@@ -43,6 +44,10 @@ const YEMOT_PASSWORD = process.env.YEMOT_PASSWORD || '';
 const YEMOT_EXT_PATH = process.env.YEMOT_EXT_PATH || '';
 const HOLD_MUSIC_NAME = process.env.YEMOT_HOLD_MUSIC || ''; // empty = system default hold music
 const HOLD_SECONDS = 4; // short poll interval while waiting, so updates feel near-live
+// Anti-stuck: if the active player does nothing (or drops the call) for this
+// long, any OTHER player's idle poll will auto-advance the turn so the game
+// never freezes on a missing player.
+const TURN_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes
 const KEY_PREFIX = 'monopoly:';
 
 // ---- Small Redis (Upstash REST) helper -------------------------------------
@@ -73,6 +78,20 @@ async function loadGame(code) {
 }
 async function saveGame(code, game) {
   await rSet(`game:${code}`, JSON.stringify(game), GAME_TTL);
+}
+
+// ---- Reconnect-by-phone index ---------------------------------------------
+// Maps a caller's phone number (Yemot `ApiPhone`) to the game + player they
+// belong to, so that after a dropped call they can dial back in and resume
+// as the same player instead of starting over (feature: ניתוק וחיבור מחדש).
+async function savePhoneRef(phone, code, playerId) {
+  if (!phone) return;
+  await rSet(`phone:${phone}`, JSON.stringify({ code, playerId }), GAME_TTL);
+}
+async function loadPhoneRef(phone) {
+  if (!phone) return null;
+  const raw = await rGet(`phone:${phone}`);
+  return raw ? JSON.parse(raw) : null;
 }
 
 // ---- Custom-message-override cache (management API file listing) ----------
@@ -276,8 +295,10 @@ function newGame(code) {
     code,
     createdAt: Date.now(),
     started: false,
+    over: false,
     players: [],
     turn: 0,
+    turnStartedAt: 0, // ms timestamp when the current turn began (anti-stuck)
     houses: {},
     owners: {},
     mortgaged: {},
@@ -285,6 +306,86 @@ function newGame(code) {
     log: [], // { seq, text }
     logSeq: 0,
   };
+}
+
+// Advances the turn to the next non-bankrupt player and resets that player's
+// per-turn state + the anti-stuck timer. Guarded against an infinite loop if
+// everyone left is bankrupt.
+function advanceTurn(game) {
+  let next = (game.turn + 1) % game.players.length;
+  let guard = 0;
+  while (game.players[next].bankrupt && guard++ < game.players.length) {
+    next = (next + 1) % game.players.length;
+  }
+  game.turn = next;
+  game.turnStartedAt = Date.now();
+  const np = game.players[next];
+  np.hasRolled = false;
+  np.extraRoll = false;
+  np.doublesStreak = 0;
+  return np;
+}
+
+// Anti-stuck: if the active player has been idle past TURN_TIMEOUT_MS, skip
+// their turn. Returns the new active player if a skip happened, else null.
+// Only meaningful to call from a NON-active player's poll.
+async function maybeAutoSkip(game) {
+  if (!game.started || game.over) return null;
+  if (!game.turnStartedAt) {
+    game.turnStartedAt = Date.now();
+    return null;
+  }
+  if (Date.now() - game.turnStartedAt <= TURN_TIMEOUT_MS) return null;
+  const skipped = currentPlayer(game);
+  const np = advanceTurn(game);
+  await broadcastLog(game, `${skipped.name} לא פעל בזמן והתור עבר אוטומטית ל${np.name}`);
+  return np;
+}
+
+// Square indices owned by a player, sorted by board position.
+function ownedSquares(game, playerId) {
+  return Object.keys(game.owners)
+    .filter((k) => game.owners[k] === playerId)
+    .map(Number)
+    .sort((a, b) => a - b);
+}
+
+// Does the player's color group (for a property square) currently have any
+// houses on it? Mortgaging is blocked while the group still has buildings.
+function groupHasHouses(game, square) {
+  if (square.type !== 'property') return false;
+  return groupSquares(square.group).some((s) => (game.houses[s.i] || 0) > 0);
+}
+
+function mortgageValue(square) {
+  return Math.floor((square.price || 100) / 2);
+}
+// Redeeming a mortgaged property costs the mortgage value plus 10% interest.
+function redeemCost(square) {
+  return Math.ceil(mortgageValue(square) * 1.1);
+}
+
+// Player's total net worth: cash + unmortgaged property prices + built houses.
+function netWorth(game, p) {
+  let w = p.money;
+  for (const k of ownedSquares(game, p.id)) {
+    const sq = squareAt(k);
+    if (!game.mortgaged[k]) w += sq.price || 0;
+    w += (game.houses[k] || 0) * houseCostFor(sq);
+  }
+  return w;
+}
+
+// Appends a final standings table (players ranked by net worth) to `segments`.
+async function announceStandings(game, segments) {
+  const ranked = [...game.players].sort((a, b) => netWorth(game, b) - netWorth(game, a));
+  const places = ['במקום הראשון', 'במקום השני', 'במקום השלישי', 'במקום הרביעי', 'במקום החמישי', 'במקום השישי'];
+  segments.push(await msg('sSTANDINGS', 'טבלת הדירוג הסופית לפי הון'));
+  for (let i = 0; i < ranked.length; i++) {
+    const p = ranked[i];
+    const place = places[i] || `במקום ${i + 1}`;
+    segments.push(await msg('sPLACE_' + (i + 1), `${place}, ${p.name}, עם הון של ${netWorth(game, p)} שקלים`));
+  }
 }
 
 function currentPlayer(game) {
@@ -391,9 +492,33 @@ module.exports = async (req, res) => {
     // ---- Entry point ---------------------------------------------------
     if (!flow.step) {
       flow = { step: 'main_menu', seq: 0 };
+
+      // Reconnect-by-phone: if this caller's number is tied to a player in a
+      // still-running game they haven't lost, offer to rejoin it.
+      const phone = params.ApiPhone || '';
+      let reconnectOffer = false;
+      if (phone) {
+        const ref = await loadPhoneRef(phone);
+        if (ref) {
+          const g = await loadGame(ref.code);
+          const pl = g && g.players.find((p) => p.id === ref.playerId);
+          if (g && !g.over && pl && !pl.bankrupt) {
+            flow.reconnect = ref;
+            reconnectOffer = true;
+          }
+        }
+      }
+
       const pName = nextParamName(flow);
       flow.expect = pName;
       await saveFlow(flow);
+      if (reconnectOffer) {
+        const welcome = await msg('s1025', 'ברוכים הבאים למונופול הטלפוני. לחזרה למשחק הקודם שלכם הקישו שלוש. להתחלת משחק חדש הקישו אחת. להצטרפות למשחק קיים הקישו שתיים');
+        res.status(200).send(
+          respond([welcome], { readParams: menuReadParams({ name: pName, allowed: '123' }) })
+        );
+        return;
+      }
       const welcome = await msg('s1000', 'ברוכים הבאים למונופול הטלפוני. להתחלת משחק חדש הקישו אחת. להצטרפות למשחק קיים הקישו שתיים');
       res.status(200).send(
         respond([welcome], {
@@ -406,6 +531,23 @@ module.exports = async (req, res) => {
     // ---- MAIN MENU -------------------------------------------------------
     if (flow.step === 'main_menu') {
       const choice = params[flow.expect];
+      if (choice === '3' && flow.reconnect) {
+        const ref = flow.reconnect;
+        const game = await loadGame(ref.code);
+        const player = game && game.players.find((p) => p.id === ref.playerId);
+        if (!game || game.over || !player || player.bankrupt) {
+          const err = await msg('s1026', 'לא נמצא משחק פעיל לחזרה');
+          res.status(200).send(respond([err], { extra: `go_to_folder=/${ext}` }));
+          return;
+        }
+        // Re-bind this call to the existing player.
+        player.callId = callId;
+        await saveGame(ref.code, game);
+        await savePhoneRef(params.ApiPhone || '', ref.code, player.id);
+        flow = { step: 'in_game', code: ref.code, playerId: player.id, seq: flow.seq };
+        const t = await msg('s1027', `חזרתם למשחק ${player.name}. יש לכם ${player.money} שקלים`);
+        return sendGameState(res, flow, saveFlow, game, player, [t]);
+      }
       if (choice === '1') {
         flow = { step: 'ask_player_count', seq: flow.seq };
         const pName = nextParamName(flow);
@@ -512,6 +654,7 @@ module.exports = async (req, res) => {
       const player = {
         id: `p${game.players.length + 1}`,
         callId,
+        phone: params.ApiPhone || '',
         name,
         money: board.startMoney,
         pos: 0,
@@ -520,17 +663,22 @@ module.exports = async (req, res) => {
         doublesStreak: 0,
         hasRolled: false, // did this player already roll the dice this turn?
         extraRoll: false, // did they earn another roll (doubles) this turn?
+        getOutFree: 0, // number of "get out of jail free" cards held
         bankrupt: false,
         lastSeenSeq: 0,
+        lastHeardTurn: -1, // last game.turn value we announced to this player
       };
       game.players.push(player);
 
       const readyToStart = game.players.length >= game.expectedPlayers;
       if (readyToStart) {
         game.started = true;
+        game.turnStartedAt = Date.now();
         await broadcastLog(game, 'כל השחקנים הצטרפו. המשחק מתחיל');
       }
       await saveGame(code, game);
+      // Remember this phone -> player so a dropped call can reconnect.
+      await savePhoneRef(player.phone, code, player.id);
 
       flow = { step: 'in_game', code, playerId: player.id, seq: flow.seq };
 
@@ -605,32 +753,57 @@ module.exports = async (req, res) => {
 // Yemot resends every previously-collected parameter on every request, so
 // reusing a fixed name like "ACTION" across turns/menus causes stale old
 // values to be mistaken for fresh ones).
+// Turn action menu digits and spoken menu text (kept in sync).
+const ACTION_ALLOWED = '0123456*';
+const ACTION_MENU_TEXT =
+  'להטלת קוביות הקישו אחת. לשמיעת מצב אישי הקישו שתיים. לבניית בתים הקישו שלוש. לסיום התור הקישו ארבע. למצב כל השחקנים הקישו חמש. לניהול נכסים הקישו שש. לחזרה על התפריט הקישו אפס. לעזרה הקישו כוכבית';
+
 async function sendGameState(res, flow, saveFlow, game, player, prefixSegments = []) {
+  // A non-active caller's poll can trigger the anti-stuck auto-skip.
+  if (currentPlayer(game).id !== player.id) {
+    await maybeAutoSkip(game);
+  }
+
   const active = currentPlayer(game);
-  const unseen = unseenLogFor(game, player.lastSeenSeq);
   const announceSegments = [];
-  for (const entry of unseen) {
+  for (const entry of unseenLogFor(game, player.lastSeenSeq)) {
     announceSegments.push(await msg('sLOG_' + entry.seq, entry.text));
   }
   player.lastSeenSeq = game.logSeq;
-  await saveGame(game.code, game);
+
+  // Game finished: play any final announcements and end the call.
+  if (game.over) {
+    await saveGame(game.code, game);
+    res.status(200).send(
+      respond([...prefixSegments, ...announceSegments], { extra: 'go_to_folder=/' })
+    );
+    return;
+  }
 
   if (active.id === player.id && !active.bankrupt) {
+    player.lastHeardTurn = game.turn;
+    await saveGame(game.code, game);
     const t1 = await msg('s1018', `זהו תורך ${player.name}. יש לכם ${player.money} שקלים`);
-    const t2 = await msg('s1019', 'להטלת קוביות הקישו אחת. לשמיעת מצב אישי הקישו שתיים. לבניית בתים הקישו שלוש. לסיום התור הקישו ארבע');
+    const t2 = await msg('s1019', ACTION_MENU_TEXT);
     const pName = nextParamName(flow);
     flow.expect = pName;
     flow.expectKind = 'action';
     await saveFlow(flow);
     res.status(200).send(
       respond([...prefixSegments, ...announceSegments, t1, t2], {
-        readParams: menuReadParams({ name: pName, allowed: '1234' }),
+        readParams: menuReadParams({ name: pName, allowed: ACTION_ALLOWED }),
       })
     );
     return;
   }
 
-  // Not my turn: play any announcements, then quietly hold and re-poll
+  // Not my turn. Announce whose turn it is now (once per turn change) so a
+  // waiting player knows what's happening, then quietly hold and re-poll.
+  if (player.lastHeardTurn !== game.turn) {
+    announceSegments.push(await msg('sWHOSE_' + game.turn, `כעת תורו של ${active.name}`));
+    player.lastHeardTurn = game.turn;
+  }
+  await saveGame(game.code, game);
   const pName = nextParamName(flow);
   flow.expect = pName;
   flow.expectKind = 'poll';
@@ -638,15 +811,16 @@ async function sendGameState(res, flow, saveFlow, game, player, prefixSegments =
   res.status(200).send(respond([...prefixSegments, ...announceSegments], { wait: true, waitParamName: pName }));
 }
 
-// Sends `segments` and re-arms the ACTION menu (digits 1-4) using a fresh,
-// never-before-used read parameter name (see nextParamName()).
+// Sends `segments` and re-arms the ACTION menu using a fresh, never-before-used
+// read parameter name (see nextParamName()). Accepts the full action key set
+// (1-6, 0 to repeat the menu, * for help).
 async function sendActionMenu(res, flow, saveFlow, segments) {
   const pName = nextParamName(flow);
   flow.expect = pName;
   flow.expectKind = 'action';
   await saveFlow(flow);
   res.status(200).send(
-    respond(segments, { readParams: menuReadParams({ name: pName, allowed: '1234' }) })
+    respond(segments, { readParams: menuReadParams({ name: pName, allowed: ACTION_ALLOWED }) })
   );
 }
 
@@ -677,19 +851,30 @@ async function sendBuildMenu(res, flow, saveFlow, segments, count) {
   );
 }
 
+// Menu kinds that expect a keypress value back (as opposed to a silent poll).
+const MENU_KINDS = ['action', 'buy', 'build', 'manage', 'select'];
+
 async function handleInGameAction(res, flow, saveFlow, game, player, params) {
   const expectKind = flow.expectKind;
-  const value = flow.expect ? params[flow.expect] : undefined;
-  const action = expectKind === 'action' ? value : undefined;
-  const buyChoice = expectKind === 'buy' ? value : undefined;
-  const buildChoice = expectKind === 'build' ? value : undefined;
+  const rawValue = flow.expect ? params[flow.expect] : undefined;
+  // Treat an absent OR empty value (e.g. a silent hold-poll timing out) as
+  // "no input". A real keypress like '0' is a non-empty string and survives.
+  const value = rawValue === undefined || rawValue === '' ? undefined : rawValue;
+  const hasMenuValue = MENU_KINDS.includes(expectKind) && value !== undefined;
+
+  // If the active player is the one contacting us, refresh their anti-stuck
+  // timer so an actively-playing player is never auto-skipped.
+  if (currentPlayer(game).id === player.id && !player.bankrupt) {
+    game.turnStartedAt = Date.now();
+    await saveGame(game.code, game);
+  }
 
   // Coming back from a hold-music wait, or with no usable value at all —
   // just re-evaluate state: announce anything new, resume waiting or show
   // the turn menu. We key off `expectKind`/the exact param name we asked
   // for last time, never a fixed name, so a stale accumulated value from
   // earlier in the call can never be misread as a fresh answer.
-  if (action === undefined && buyChoice === undefined && buildChoice === undefined) {
+  if (!hasMenuValue) {
     return sendGameState(res, flow, saveFlow, game, player, []);
   }
 
@@ -697,26 +882,55 @@ async function handleInGameAction(res, flow, saveFlow, game, player, params) {
   const isMyTurn = active.id === player.id && !active.bankrupt;
 
   if (!isMyTurn) {
-    // Shouldn't normally get an ACTION here, but guard anyway
+    // Shouldn't normally get a menu value here, but guard anyway
     return sendGameState(res, flow, saveFlow, game, player, []);
   }
 
-  if (expectKind === 'buy' && game.pendingBuy !== null && game.pendingBuy !== undefined && buyChoice !== undefined) {
-    return handleBuyDecision(res, flow, saveFlow, game, player, buyChoice);
+  if (expectKind === 'buy' && game.pendingBuy !== null && game.pendingBuy !== undefined) {
+    return handleBuyDecision(res, flow, saveFlow, game, player, value);
+  }
+  if (expectKind === 'build') {
+    return handleBuildChoice(res, flow, saveFlow, game, player, value);
+  }
+  if (expectKind === 'manage') {
+    return handleManageMenu(res, flow, saveFlow, game, player, value);
+  }
+  if (expectKind === 'select') {
+    return handleSelectPick(res, flow, saveFlow, game, player, value);
   }
 
-  if (expectKind === 'build' && buildChoice !== undefined) {
-    return handleBuildChoice(res, flow, saveFlow, game, player, buildChoice);
-  }
+  // expectKind === 'action'
+  if (value === '0') return sendGameState(res, flow, saveFlow, game, player, []); // repeat menu
+  if (value === '*') return announceHelp(res, flow, saveFlow, game, player); // help
+  if (value === '1') return rollDiceAndMove(res, flow, saveFlow, game, player);
+  if (value === '2') return announcePersonalStatus(res, flow, saveFlow, game, player);
+  if (value === '3') return handleBuildHouses(res, flow, saveFlow, game, player);
+  if (value === '4') return endTurn(res, flow, saveFlow, game, player);
+  if (value === '5') return announceAllPlayers(res, flow, saveFlow, game, player);
+  if (value === '6') return openManageMenu(res, flow, saveFlow, game, player);
 
-  if (action === '1') return rollDiceAndMove(res, flow, saveFlow, game, player);
-  if (action === '2') return announcePersonalStatus(res, flow, saveFlow, game, player);
-  if (action === '3') return handleBuildHouses(res, flow, saveFlow, game, player);
-  if (action === '4') return endTurn(res, flow, saveFlow, game, player);
-
-  // Shouldn't be reachable since `allowed` restricts input to 1-4, but keep
-  // a safe fallback that re-shows the menu without an error tone.
+  // Safe fallback: re-show the menu without an error tone.
   return sendGameState(res, flow, saveFlow, game, player, []);
+}
+
+// Feature: voice help (*). Reads a short rules summary, then re-arms the menu.
+async function announceHelp(res, flow, saveFlow, game, player) {
+  const t = await msg(
+    'sHELP',
+    'מונופול טלפוני. בתורכם הטילו קוביות ונועו על הלוח. נכס פנוי ניתן לקנייה, ונחיתה על נכס של יריב מחייבת בתשלום שכירות. השלמת קבוצת צבע שלמה מאפשרת בניית בתים שמגדילים את השכירות. שלושה דאבלים ברציפות שולחים לכלא. המנצח הוא מי שנשאר אחרון לאחר שכל השאר פשטו רגל. בכל שלב ניתן להקיש אפס לחזרה על התפריט וכוכבית לעזרה'
+  );
+  return sendActionMenu(res, flow, saveFlow, [t]);
+}
+
+// Feature: summary of all players' money and property counts.
+async function announceAllPlayers(res, flow, saveFlow, game, player) {
+  const segs = [await msg('sALL', 'מצב כל השחקנים')];
+  for (const p of game.players) {
+    const propCount = ownedSquares(game, p.id).length;
+    const status = p.bankrupt ? 'פשט את הרגל' : `${p.money} שקלים ו${propCount} נכסים`;
+    segs.push(await msg('sALL_' + p.id, `${p.name}, ${status}`));
+  }
+  return sendActionMenu(res, flow, saveFlow, segs);
 }
 
 async function rollDiceAndMove(res, flow, saveFlow, game, player) {
@@ -768,6 +982,14 @@ async function rollDiceAndMove(res, flow, saveFlow, game, player) {
       const segs = [diceMsg];
       if (passedGo) segs.push(await msg('s1022', `עברתם בהתחלה וקיבלתם ${board.goMoney} שקלים`));
       return resolveSquare(res, flow, saveFlow, game, player, square, segs);
+    } else if (player.getOutFree > 0) {
+      // Use a held "get out of jail free" card: exit and move normally (no
+      // bonus roll), falling through to the standard movement logic below.
+      player.getOutFree -= 1;
+      player.inJail = false;
+      player.jailTurns = 0;
+      player.doublesStreak = 0;
+      await broadcastLog(game, `${player.name} השתמש בכרטיס יציאה מהכלא`);
     } else {
       player.jailTurns += 1;
       if (player.jailTurns >= 3) {
@@ -840,7 +1062,11 @@ async function resolveSquare(res, flow, saveFlow, game, player, square, segments
     return checkBankruptcyThenContinue(res, flow, saveFlow, game, player, segments);
   }
 
-  if (['go', 'jail', 'parking', 'chest', 'chance'].includes(square.type)) {
+  if (square.type === 'chest' || square.type === 'chance') {
+    return drawCard(res, flow, saveFlow, game, player, square.type, segments);
+  }
+
+  if (['go', 'jail', 'parking'].includes(square.type)) {
     segments.push(await msg('sFREE', 'משבצת זו אינה דורשת פעולה'));
     player.lastSeenSeq = game.logSeq;
     await saveGame(game.code, game);
@@ -898,6 +1124,59 @@ async function resolveSquare(res, flow, saveFlow, game, player, square, segments
   return checkBankruptcyThenContinue(res, flow, saveFlow, game, player, segments);
 }
 
+// Feature: chance / community-chest cards. Draws a random card from the deck
+// and applies its effect.
+async function drawCard(res, flow, saveFlow, game, player, deckName, segments) {
+  const deck = cards[deckName] || [];
+  if (deck.length === 0) {
+    segments.push(await msg('sFREE', 'משבצת זו אינה דורשת פעולה'));
+    player.lastSeenSeq = game.logSeq;
+    await saveGame(game.code, game);
+    return sendActionMenu(res, flow, saveFlow, segments);
+  }
+  const card = deck[Math.floor(Math.random() * deck.length)];
+  const deckLabel = deckName === 'chance' ? 'צאט' : 'קופה קהילתית';
+  segments.push(await msg('sCARD_' + deckName, `כרטיס ${deckLabel}. ${card.text}`));
+  await broadcastLog(game, `${player.name} שלף כרטיס ${deckLabel}: ${card.text}`);
+  return applyCard(res, flow, saveFlow, game, player, card, segments);
+}
+
+async function applyCard(res, flow, saveFlow, game, player, card, segments) {
+  switch (card.type) {
+    case 'money':
+      player.money += card.amount;
+      return checkBankruptcyThenContinue(res, flow, saveFlow, game, player, segments);
+
+    case 'getoutfree':
+      player.getOutFree = (player.getOutFree || 0) + 1;
+      player.lastSeenSeq = game.logSeq;
+      await saveGame(game.code, game);
+      return sendActionMenu(res, flow, saveFlow, segments);
+
+    case 'gotojail':
+      sendToJail(player);
+      player.lastSeenSeq = game.logSeq;
+      await saveGame(game.code, game);
+      return sendActionMenu(res, flow, saveFlow, segments);
+
+    case 'move': {
+      const len = board.squares.length;
+      const oldPos = player.pos;
+      player.pos = (((card.to % len) + len) % len);
+      // Passing GO while advancing forward pays goMoney (unless card opts out).
+      const passedGo = card.passGo !== false && player.pos < oldPos;
+      if (passedGo) player.money += board.goMoney;
+      const sq = squareAt(player.pos);
+      segments.push(await msg('sCARDMOVE', `עברתם אל ${sq.name}`));
+      if (passedGo) segments.push(await msg('s1022', `עברתם בהתחלה וקיבלתם ${board.goMoney} שקלים`));
+      return resolveSquare(res, flow, saveFlow, game, player, sq, segments);
+    }
+
+    default:
+      return checkBankruptcyThenContinue(res, flow, saveFlow, game, player, segments);
+  }
+}
+
 async function checkBankruptcyThenContinue(res, flow, saveFlow, game, player, segments) {
   if (player.money < 0) liquidateIfNeeded(game, player);
 
@@ -914,9 +1193,14 @@ async function checkBankruptcyThenContinue(res, flow, saveFlow, game, player, se
     segments.push(await msg('sBANKRUPT', 'לא נותר לכם מספיק כסף. פשטתם את הרגל ואתם יוצאים מהמשחק'));
 
     const remaining = game.players.filter((p) => !p.bankrupt);
-    if (remaining.length === 1) {
-      await broadcastLog(game, `${remaining[0].name} הוא המנצח במשחק`);
-      segments.push(await msg('sWIN', `${remaining[0].name} הוא המנצח במשחק! ברכותינו`));
+    if (remaining.length <= 1) {
+      // Game over: announce the winner plus a full standings table by wealth.
+      if (remaining.length === 1) {
+        await broadcastLog(game, `${remaining[0].name} הוא המנצח במשחק`);
+        segments.push(await msg('sWIN', `${remaining[0].name} הוא המנצח במשחק! ברכותינו`));
+      }
+      await announceStandings(game, segments);
+      game.over = true;
     }
     player.lastSeenSeq = game.logSeq;
     await saveGame(game.code, game);
@@ -1087,6 +1371,132 @@ async function handleBuildChoice(res, flow, saveFlow, game, player, choice) {
   return sendActionMenu(res, flow, saveFlow, [t]);
 }
 
+// ---- Property management (sell house / mortgage / redeem) -----------------
+// Returns the square indices eligible for a given management operation.
+function eligibleFor(game, playerId, op) {
+  const owned = ownedSquares(game, playerId);
+  if (op === 'sellhouse') return owned.filter((i) => (game.houses[i] || 0) > 0);
+  if (op === 'mortgage') return owned.filter((i) => !game.mortgaged[i] && !groupHasHouses(game, squareAt(i)));
+  if (op === 'redeem') return owned.filter((i) => game.mortgaged[i]);
+  return [];
+}
+
+async function openManageMenu(res, flow, saveFlow, game, player) {
+  const t = await msg(
+    'sMANAGE',
+    'ניהול נכסים. למכירת בית הקישו אחת. למישכון נכס הקישו שתיים. לפדיון נכס ממושכן הקישו שלוש. לחזרה לתפריט הקישו אפס'
+  );
+  const pName = nextParamName(flow);
+  flow.expect = pName;
+  flow.expectKind = 'manage';
+  await saveFlow(flow);
+  res.status(200).send(respond([t], { readParams: menuReadParams({ name: pName, allowed: '0123' }) }));
+}
+
+async function handleManageMenu(res, flow, saveFlow, game, player, value) {
+  if (value === '0') return sendGameState(res, flow, saveFlow, game, player, []);
+  if (value === '1') return openManageOp(res, flow, saveFlow, game, player, 'sellhouse');
+  if (value === '2') return openManageOp(res, flow, saveFlow, game, player, 'mortgage');
+  if (value === '3') return openManageOp(res, flow, saveFlow, game, player, 'redeem');
+  return openManageMenu(res, flow, saveFlow, game, player);
+}
+
+// Presents the list of properties eligible for `op` and arms a select menu.
+async function openManageOp(res, flow, saveFlow, game, player, op) {
+  const opts = eligibleFor(game, player.id, op);
+  if (opts.length === 0) {
+    const t = await msg('sMANAGENONE', 'אין נכסים מתאימים לפעולה זו');
+    return sendActionMenu(res, flow, saveFlow, [t]);
+  }
+  const offered = opts.slice(0, 9);
+  flow.selOptions = offered;
+  flow.selOp = op;
+  const pName = nextParamName(flow);
+  flow.expect = pName;
+  flow.expectKind = 'select';
+  await saveFlow(flow);
+
+  const verb = op === 'sellhouse' ? 'למכירת בית ב' : op === 'mortgage' ? 'למישכון ' : 'לפדיון ';
+  const segs = [await msg('sSELMENU', 'בחרו נכס')];
+  for (let idx = 0; idx < offered.length; idx++) {
+    const i = offered[idx];
+    const sq = squareAt(i);
+    let extra = '';
+    if (op === 'sellhouse') extra = `, כרגע ${game.houses[i] || 0} בתים, החזר ${priceText(Math.floor(houseCostFor(sq) / 2))}`;
+    else if (op === 'mortgage') extra = `, תמורת ${priceText(mortgageValue(sq))}`;
+    else extra = `, בעלות ${priceText(redeemCost(sq))}`;
+    segs.push(await msg('sSELOPT_' + (idx + 1), `${verb}${sq.name}${extra}, הקישו ${idx + 1}`));
+  }
+  segs.push(await msg('sSELCANCEL', 'לביטול הקישו אפס'));
+  const allowed = '0' + offered.map((_, i) => String(i + 1)).join('');
+  res.status(200).send(respond(segs, { readParams: menuReadParams({ name: pName, allowed }) }));
+}
+
+async function handleSelectPick(res, flow, saveFlow, game, player, choice) {
+  const op = flow.selOp;
+  const options = flow.selOptions || [];
+  const clearSel = () => {
+    flow.selOptions = null;
+    flow.selOp = null;
+  };
+
+  if (choice === '0') {
+    clearSel();
+    await saveFlow(flow);
+    const t = await msg('sSELCANCELED', 'הפעולה בוטלה');
+    return sendActionMenu(res, flow, saveFlow, [t]);
+  }
+
+  const pick = parseInt(choice, 10);
+  if (!pick || pick < 1 || pick > options.length) {
+    return openManageOp(res, flow, saveFlow, game, player, op);
+  }
+
+  const i = options[pick - 1];
+  const sq = squareAt(i);
+
+  // Re-validate against live state before committing.
+  if (!eligibleFor(game, player.id, op).includes(i)) {
+    clearSel();
+    await saveFlow(flow);
+    const t = await msg('sSELINVALID', 'הנכס אינו מתאים יותר לפעולה זו');
+    return sendActionMenu(res, flow, saveFlow, [t]);
+  }
+
+  let t;
+  if (op === 'sellhouse') {
+    const refund = Math.floor(houseCostFor(sq) / 2);
+    game.houses[i] = (game.houses[i] || 0) - 1;
+    if (game.houses[i] <= 0) delete game.houses[i];
+    player.money += refund;
+    await broadcastLog(game, `${player.name} מכר בית ב${sq.name}`);
+    t = await msg('sSOLDHOUSE', `מכרתם בית ב${sq.name} וקיבלתם ${priceText(refund)}`);
+  } else if (op === 'mortgage') {
+    const val = mortgageValue(sq);
+    game.mortgaged[i] = true;
+    player.money += val;
+    await broadcastLog(game, `${player.name} מישכן את ${sq.name}`);
+    t = await msg('sMORTGAGED', `מישכנתם את ${sq.name} וקיבלתם ${priceText(val)}`);
+  } else {
+    const cost = redeemCost(sq);
+    if (player.money < cost) {
+      clearSel();
+      await saveFlow(flow);
+      const e = await msg('sNOMONEYREDEEM', 'אין לכם מספיק כסף לפדיון הנכס');
+      return sendActionMenu(res, flow, saveFlow, [e]);
+    }
+    player.money -= cost;
+    delete game.mortgaged[i];
+    await broadcastLog(game, `${player.name} פדה את ${sq.name}`);
+    t = await msg('sREDEEMED', `פדיתם את ${sq.name} בעלות ${priceText(cost)}`);
+  }
+
+  clearSel();
+  player.lastSeenSeq = game.logSeq;
+  await saveGame(game.code, game);
+  return sendActionMenu(res, flow, saveFlow, [t]);
+}
+
 async function endTurn(res, flow, saveFlow, game, player) {
   // Earned another roll by rolling a double this turn: stay on the same turn
   // and let the player roll again, rather than passing the turn along.
@@ -1104,16 +1514,9 @@ async function endTurn(res, flow, saveFlow, game, player) {
   player.extraRoll = false;
   player.doublesStreak = 0;
 
-  let next = (game.turn + 1) % game.players.length;
-  while (game.players[next].bankrupt) {
-    next = (next + 1) % game.players.length;
-  }
-  game.turn = next;
-  const nextPlayer = game.players[next];
-  // Give the incoming player a clean turn slate.
-  nextPlayer.hasRolled = false;
-  nextPlayer.extraRoll = false;
-  nextPlayer.doublesStreak = 0;
+  // Advance to the next non-bankrupt player (also resets the anti-stuck timer
+  // and the incoming player's per-turn state).
+  const nextPlayer = advanceTurn(game);
   await broadcastLog(game, `עובר תור ל${nextPlayer.name}`);
 
   player.lastSeenSeq = game.logSeq;

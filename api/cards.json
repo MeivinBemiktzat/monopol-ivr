@@ -1,0 +1,27 @@
+{
+  "_comment": "Chance (צאט) and Community-Chest (קופה קהילתית) card decks. Each card has a `type` and a Hebrew `text` read aloud. Supported types: money {amount: +/-N}, move {to: squareIndex, passGo?: bool}, gotojail, getoutfree. Move targets should NOT be chance/chest squares to avoid re-draw recursion.",
+  "chance": [
+    { "type": "move", "to": 0, "passGo": true, "text": "התקדמו אל ההתחלה" },
+    { "type": "move", "to": 39, "passGo": true, "text": "התקדמו אל תל אביב" },
+    { "type": "move", "to": 24, "passGo": true, "text": "התקדמו אל בני ברק" },
+    { "type": "move", "to": 11, "passGo": true, "text": "התקדמו אל נהריה" },
+    { "type": "gotojail", "text": "לכו לכלא, אל תעברו בהתחלה" },
+    { "type": "getoutfree", "text": "כרטיס יציאה מהכלא בחינם, שמרו אותו" },
+    { "type": "money", "amount": 150, "text": "קיבלתם דיבידנד מהבנק בסך מאה חמישים שקלים" },
+    { "type": "money", "amount": 100, "text": "זכיתם בפרס יופי, קיבלתם מאה שקלים" },
+    { "type": "money", "amount": -50, "text": "שלמו דמי ביטוח בסך חמישים שקלים" },
+    { "type": "money", "amount": -100, "text": "קנס על נהיגה מהירה, שלמו מאה שקלים" }
+  ],
+  "chest": [
+    { "type": "move", "to": 0, "passGo": true, "text": "התקדמו אל ההתחלה" },
+    { "type": "gotojail", "text": "טעות של פקיד הבנק, לכו לכלא" },
+    { "type": "getoutfree", "text": "כרטיס יציאה מהכלא בחינם, שמרו אותו" },
+    { "type": "money", "amount": 200, "text": "טעות לטובתכם, הבנק משלם לכם מאתיים שקלים" },
+    { "type": "money", "amount": 100, "text": "קיבלתם ירושה בסך מאה שקלים" },
+    { "type": "money", "amount": 50, "text": "החזר מס הכנסה, קיבלתם חמישים שקלים" },
+    { "type": "money", "amount": 25, "text": "דמי ייעוץ, קיבלתם עשרים וחמישה שקלים" },
+    { "type": "money", "amount": -50, "text": "שלמו לבית החולים חמישים שקלים" },
+    { "type": "money", "amount": -100, "text": "שלמו עבור תיקונים מאה שקלים" },
+    { "type": "money", "amount": -150, "text": "שלמו שכר לימוד בסך מאה חמישים שקלים" }
+  ]
+}
