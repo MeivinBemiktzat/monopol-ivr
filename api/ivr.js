@@ -34,6 +34,13 @@
 // ============================================================================
 
 const board = require('./board.json');
+if (board.squares.length !== 40 || board.squares.some((sq, i) =>
+  sq.i !== i || !sq.name ||
+  (['property', 'railroad', 'utility'].includes(sq.type) &&
+    (!Number.isInteger(sq.price) || sq.price <= 0)) ||
+  (['property', 'railroad'].includes(sq.type) &&
+    (!Array.isArray(sq.rent) || sq.rent.some(n => !Number.isInteger(n) || n < 0)))
+)) throw new Error('Invalid Monopoly board definition');
 const cards = require('./cards.json');
 
 // ---- Config from environment -----------------------------------------------
@@ -476,7 +483,23 @@ function colorPhrase(square) {
 }
 
 function squareAt(i) {
-  return board.squares[i % board.squares.length];
+  const len = board.squares.length;
+  if (!Number.isInteger(i) || len !== 40) throw new Error('Invalid board position');
+  const index = ((i % len) + len) % len;
+  const square = board.squares[index];
+  if (!square || square.i !== index) throw new Error('Board index mismatch: ' + index);
+  return square;
+}
+function advanceByDice(player, d1, d2) {
+  const from = player.pos;
+  const steps = d1 + d2;
+  const passedGo = from + steps >= board.squares.length;
+  player.pos = (from + steps) % board.squares.length;
+  player.lastDiceTotal = steps;
+  const square = squareAt(player.pos);
+  ivrLog('board_move', { playerId: player.id, from, dice: [d1, d2], steps,
+    to: player.pos, square: square.name, passedGo });
+  return { passedGo, square };
 }
 
 function rentFor(square, houses, ownerPropsInGroup) {
@@ -1096,12 +1119,8 @@ async function rollDiceAndMove(res, flow, saveFlow, game, player) {
       // does NOT grant another roll — so we deliberately do not set extraRoll
       // and skip the doubles-streak bonus logic below by returning early
       // after movement.
-      const steps = d1 + d2;
-      const oldPos = player.pos;
-      player.pos = (player.pos + steps) % board.squares.length;
-      const passedGo = player.pos <= oldPos;
+      const { passedGo, square } = advanceByDice(player, d1, d2);
       if (passedGo) player.money += board.goMoney;
-      const square = squareAt(player.pos);
       await broadcastLog(game, `${player.name} הטיל ${d1} ו${d2} ונחת על ${square.name}`);
       const diceMsg = await msg('sDICE', `הטלתם ${d1} ו${d2}. נחתתם על ${square.name}`);
       const segs = [diceMsg];
@@ -1149,13 +1168,8 @@ async function rollDiceAndMove(res, flow, saveFlow, game, player) {
     player.doublesStreak = 0;
   }
 
-  const steps = d1 + d2;
-  const oldPos = player.pos;
-  player.pos = (player.pos + steps) % board.squares.length;
-  const passedGo = player.pos <= oldPos && !player.inJail;
+  const { passedGo, square } = advanceByDice(player, d1, d2);
   if (passedGo) player.money += board.goMoney;
-
-  const square = squareAt(player.pos);
   await broadcastLog(game, `${player.name} הטיל ${d1} ו${d2} ונחת על ${square.name}`);
 
   const diceMsg = await msg('sDICE', `הטלתם ${d1} ו${d2}. נחתתם על ${square.name}`);
@@ -1231,9 +1245,10 @@ async function resolveSquare(res, flow, saveFlow, game, player, square, segments
   } else if (square.type === 'utility') {
     const ownedUtilities = board.squares.filter((s) => s.type === 'utility' && game.owners[s.i] === owner).length;
     const multiplier = ownedUtilities >= 2 ? 10 : 4;
-    const d1 = 1 + Math.floor(Math.random() * 6);
-    const d2 = 1 + Math.floor(Math.random() * 6);
-    rent = (d1 + d2) * multiplier;
+    // Use the dice that caused this landing, not a second random roll.
+    const diceTotal = player.lastDiceTotal;
+    if (!Number.isInteger(diceTotal)) throw new Error('Missing dice total for utility rent');
+    rent = diceTotal * multiplier;
   } else {
     const hasFullGroup = ownsFullGroup(game, owner, square.group);
     rent = rentFor(square, houses, hasFullGroup);
