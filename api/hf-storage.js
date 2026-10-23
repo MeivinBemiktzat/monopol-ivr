@@ -19,7 +19,10 @@ function s3() {
   });
 }
 const keyOf = key => 'monopoly/' + encodeURIComponent(key) + '.json';
-const seen = new Map();
+const { AsyncLocalStorage } = require('node:async_hooks');
+const context = new AsyncLocalStorage();
+const seen = () => context.getStore();
+function runWithContext(fn) { return context.run(new Map(), fn); }
 function conflict(e) {
   return e.$metadata?.httpStatusCode === 412 || e.$metadata?.httpStatusCode === 409 ||
     e.name === 'PreconditionFailed' || e.name === 'ConditionalRequestConflict';
@@ -28,11 +31,11 @@ async function get(key) {
   try {
     const result = await s3().send(new GetObjectCommand({ Bucket: bucket, Key: keyOf(key) }));
     const record = JSON.parse(await result.Body.transformToString());
-    seen.set(key, result.ETag);
+    seen()?.set(key, result.ETag);
     return record.expiresAt && Date.now() >= record.expiresAt ? null : record.value;
   } catch (e) {
     if (e.name === 'NoSuchKey' || e.$metadata?.httpStatusCode === 404) {
-      seen.set(key, null);
+      seen()?.set(key, null);
       return null;
     }
     throw e;
@@ -41,7 +44,7 @@ async function get(key) {
 async function set(key, value, ttlSeconds) {
   // The calling request MUST have loaded the key first, or explicitly create it.
   // Conditional writes ensure concurrent requests never silently overwrite data.
-  const etag = seen.has(key) ? seen.get(key) : undefined;
+  const etag = seen()?.has(key) ? seen()?.get(key) : undefined;
   const params = {
     Bucket: bucket, Key: keyOf(key),
     Body: JSON.stringify({ value, expiresAt: ttlSeconds ? Date.now() + ttlSeconds * 1000 : null }),
@@ -53,7 +56,7 @@ async function set(key, value, ttlSeconds) {
   try {
     await s3().send(new PutObjectCommand(params));
     // Avoid reusing stale ETags: a subsequent write must reload the object.
-    seen.delete(key);
+    seen()?.delete(key);
   } catch (e) {
     if (conflict(e)) throw Object.assign(new Error('Concurrent storage update; retry action'), { code: 'HF_CONFLICT' });
     throw e;
@@ -63,4 +66,4 @@ async function del(key) {
   // Deleting without CAS is unsafe. Expire the record instead.
   await set(key, null, 1);
 }
-module.exports = { get, set, del };
+module.exports = { get, set, del, runWithContext };
