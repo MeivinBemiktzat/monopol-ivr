@@ -1280,7 +1280,8 @@ async function drawCard(res, flow, saveFlow, game, player, deckName, segments) {
     return sendActionMenu(res, flow, saveFlow, segments);
   }
   const card = deck[Math.floor(Math.random() * deck.length)];
-  const deckLabel = deckName === 'chance' ? 'צאט' : 'קופה קהילתית';
+  ivrLog('card_drawn', { gameCode: game.code, playerId: player.id, deckName, cardType: card.type, amount: card.amount ?? null, target: card.to ?? null });
+  const deckLabel = deckName === 'chance' ? 'הפתעה' : 'פקודה';
   segments.push(await msg('sCARD_' + deckName, `כרטיס ${deckLabel}. ${card.text}`));
   await broadcastLog(game, `${player.name} שלף כרטיס ${deckLabel}: ${card.text}`);
   return applyCard(res, flow, saveFlow, game, player, card, segments);
@@ -1309,7 +1310,7 @@ async function applyCard(res, flow, saveFlow, game, player, card, segments) {
       const oldPos = player.pos;
       player.pos = (((card.to % len) + len) % len);
       // Passing GO while advancing forward pays goMoney (unless card opts out).
-      const passedGo = card.passGo !== false && player.pos < oldPos;
+      const passedGo = card.passGo !== false && (player.pos < oldPos || card.to === 0);
       if (passedGo) player.money += board.goMoney;
       const sq = squareAt(player.pos);
       segments.push(await msg('sCARDMOVE', `עברתם אל ${sq.name}`));
