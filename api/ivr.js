@@ -902,20 +902,24 @@ async function sendGameState(res, flow, saveFlow, game, player, prefixSegments =
     }
   };
   // A non-active caller's poll can trigger the anti-stuck auto-skip.
+  let skippedTurn = false;
   if (currentPlayer(game).id !== player.id) {
-    await maybeAutoSkip(game);
+    skippedTurn = Boolean(await maybeAutoSkip(game));
   }
 
   const active = currentPlayer(game);
   const announceSegments = [];
-  for (const entry of unseenLogFor(game, player.lastSeenSeq)) {
+  // Announcement cursors belong to this caller's flow, NOT shared game state.
+  // Polling must not overwrite game state while another player rolls dice.
+  const lastSeen = flow.lastSeenSeq === undefined ? player.lastSeenSeq : flow.lastSeenSeq;
+  for (const entry of unseenLogFor(game, lastSeen)) {
     announceSegments.push(await msg('sLOG_' + entry.seq, entry.text));
   }
-  player.lastSeenSeq = game.logSeq;
+  flow.lastSeenSeq = game.logSeq;
 
   // Game finished: play any final announcements and end the call.
   if (game.over) {
-    if (!await safeSave()) return;
+    if (skippedTurn && !await safeSave()) return;
     res.status(200).send(
       respond([...prefixSegments, ...announceSegments], { extra: 'go_to_folder=/' })
     );
@@ -923,8 +927,8 @@ async function sendGameState(res, flow, saveFlow, game, player, prefixSegments =
   }
 
   if (active.id === player.id && !active.bankrupt) {
-    player.lastHeardTurn = game.turn;
-    if (!await safeSave()) return;
+    flow.lastHeardTurn = game.turn;
+    if (skippedTurn && !await safeSave()) return;
     const t1 = await msg('s1018', `זהו תורך ${player.name}. יש לכם ${player.money} שקלים`);
     const t2 = await msg('s1019', ACTION_MENU_TEXT);
     const pName = nextParamName(flow);
@@ -941,11 +945,12 @@ async function sendGameState(res, flow, saveFlow, game, player, prefixSegments =
 
   // Not my turn. Announce whose turn it is now (once per turn change) so a
   // waiting player knows what's happening, then quietly hold and re-poll.
-  if (player.lastHeardTurn !== game.turn) {
+  const lastHeardTurn = flow.lastHeardTurn === undefined ? player.lastHeardTurn : flow.lastHeardTurn;
+  if (lastHeardTurn !== game.turn) {
     announceSegments.push(await msg('sWHOSE_' + game.turn, `כעת תורו של ${active.name}`));
-    player.lastHeardTurn = game.turn;
+    flow.lastHeardTurn = game.turn;
   }
-  if (!await safeSave()) return;
+  if (skippedTurn && !await safeSave()) return;
   const pName = nextParamName(flow);
   flow.expect = pName;
   flow.expectKind = 'poll';
