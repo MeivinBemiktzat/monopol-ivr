@@ -822,7 +822,25 @@ module.exports = async (req, res) => hf.runWithContext(async () => {
   } catch (e) {
     ivrLog('handler_error', { requestId, callTag, message: String(e && e.message || e),
       stack: String(e && e.stack || '').slice(0, 1200) }, 'error');
-    res.status(200).send('id_list_message=m-1607');
+    if (e.code === 'HF_CONFLICT' && flow && flow.step === 'in_game') {
+      ivrLog('hf_conflict_recovered', { requestId, callTag, expectKind: flow.expectKind }, 'warn');
+      const pName = nextParamName(flow);
+      const action = flow.expectKind !== 'poll';
+      flow.expect = pName;
+      flow.expectKind = action ? 'action' : 'poll';
+      try {
+        await saveFlow(flow);
+        const note = action ? await msg('sRETRY', 'המשחק עודכן במקביל. אנא בחרו שוב') : '';
+        res.status(200).send(respond(note ? [note] : [], action
+          ? { readParams: menuReadParams({ name: pName, allowed: ACTION_ALLOWED }) }
+          : { wait: true, waitParamName: pName }));
+      } catch (recoveryError) {
+        ivrLog('hf_recovery_error', { requestId, callTag, message: recoveryError.message }, 'error');
+        res.status(200).send('id_list_message=m-1607');
+      }
+    } else {
+      res.status(200).send('id_list_message=m-1607');
+    }
   }
 });
 
@@ -844,7 +862,22 @@ const ACTION_ALLOWED = '0123456*';
 const ACTION_MENU_TEXT =
   'להטלת קוביות הקישו אחת. לשמיעת מצב אישי הקישו שתיים. לבניית בתים הקישו שלוש. לסיום התור הקישו ארבע. למצב כל השחקנים הקישו חמש. לניהול נכסים הקישו שש. לחזרה על התפריט הקישו אפס. לעזרה הקישו כוכבית';
 
-async function sendGameState(res, flow, saveFlow, game, player, prefixSegments = []) {
+async function sendGameState(res, flow, saveFlow, game, player, prefixSegments = [], attempt = 0) {
+  const safeSave = async () => {
+    try {
+      await saveGame(game.code, game);
+      return true;
+    } catch (error) {
+      if (error.code !== 'HF_CONFLICT' || attempt >= 3) throw error;
+      ivrLog('hf_poll_retry', { gameCode: game.code, attempt: attempt + 1 }, 'warn');
+      const latest = await loadGame(game.code);
+      const freshPlayer = latest?.players.find(p => p.id === player.id);
+      if (!freshPlayer) throw error;
+      await new Promise(resolve => setTimeout(resolve, 40 * (attempt + 1)));
+      await sendGameState(res, flow, saveFlow, latest, freshPlayer, prefixSegments, attempt + 1);
+      return false;
+    }
+  };
   // A non-active caller's poll can trigger the anti-stuck auto-skip.
   if (currentPlayer(game).id !== player.id) {
     await maybeAutoSkip(game);
@@ -859,7 +892,7 @@ async function sendGameState(res, flow, saveFlow, game, player, prefixSegments =
 
   // Game finished: play any final announcements and end the call.
   if (game.over) {
-    await saveGame(game.code, game);
+    if (!await safeSave()) return;
     res.status(200).send(
       respond([...prefixSegments, ...announceSegments], { extra: 'go_to_folder=/' })
     );
@@ -868,7 +901,7 @@ async function sendGameState(res, flow, saveFlow, game, player, prefixSegments =
 
   if (active.id === player.id && !active.bankrupt) {
     player.lastHeardTurn = game.turn;
-    await saveGame(game.code, game);
+    if (!await safeSave()) return;
     const t1 = await msg('s1018', `זהו תורך ${player.name}. יש לכם ${player.money} שקלים`);
     const t2 = await msg('s1019', ACTION_MENU_TEXT);
     const pName = nextParamName(flow);
@@ -889,7 +922,7 @@ async function sendGameState(res, flow, saveFlow, game, player, prefixSegments =
     announceSegments.push(await msg('sWHOSE_' + game.turn, `כעת תורו של ${active.name}`));
     player.lastHeardTurn = game.turn;
   }
-  await saveGame(game.code, game);
+  if (!await safeSave()) return;
   const pName = nextParamName(flow);
   flow.expect = pName;
   flow.expectKind = 'poll';
@@ -953,9 +986,9 @@ async function handleInGameAction(res, flow, saveFlow, game, player, params) {
 
   // If the active player is the one contacting us, refresh their anti-stuck
   // timer so an actively-playing player is never auto-skipped.
-  if (currentPlayer(game).id === player.id && !player.bankrupt) {
+  if (hasMenuValue && currentPlayer(game).id === player.id && !player.bankrupt) {
     game.turnStartedAt = Date.now();
-    await saveGame(game.code, game);
+    // The actual action will persist this. Never write solely for an idle poll.
   }
 
   // Coming back from a hold-music wait, or with no usable value at all —
