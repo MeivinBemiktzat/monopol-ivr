@@ -100,12 +100,26 @@ async function redis(cmd) {
   if (elapsedMs > 400) ivrLog('redis_slow', { command, keyType, elapsedMs }, 'warn');
   return data.result;
 }
-const rGet = async (k) => redis(['GET', KEY_PREFIX + k]);
-const rSet = async (k, v, ttlSeconds) =>
-  ttlSeconds
-    ? redis(['SET', KEY_PREFIX + k, v, 'EX', String(ttlSeconds)])
-    : redis(['SET', KEY_PREFIX + k, v]);
-const rDel = async (k) => redis(['DEL', KEY_PREFIX + k]);
+// HF Buckets is the active backend; Upstash is retained for rollback only.
+const hf = require('./hf-storage');
+const rGet = async k => {
+  const started = Date.now();
+  const result = await hf.get(KEY_PREFIX + k);
+  ivrLog('hf_get', { keyType: k.split(':')[0], elapsedMs: Date.now() - started, found: result !== null });
+  return result;
+};
+const rSet = async (k, value, ttlSeconds) => {
+  const started = Date.now();
+  // Explicit read for records that may be created without a prior load.
+  // The adapter uses the ETag of that read for conditional writes.
+  await hf.get(KEY_PREFIX + k);
+  await hf.set(KEY_PREFIX + k, value, ttlSeconds);
+  ivrLog('hf_set', { keyType: k.split(':')[0], elapsedMs: Date.now() - started });
+};
+const rDel = async k => {
+  await hf.get(KEY_PREFIX + k);
+  await hf.del(KEY_PREFIX + k);
+};
 
 const GAME_TTL = 60 * 60 * 12; // 12h idle expiry per game
 
@@ -505,7 +519,7 @@ function unseenLogFor(game, lastSeenSeq) {
 // MAIN HANDLER
 // ============================================================================
 
-module.exports = async (req, res) => {
+module.exports = async (req, res) => hf.runWithContext(async () => {
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');
 
   const params = { ...req.query, ...(req.body || {}) };
@@ -810,7 +824,7 @@ module.exports = async (req, res) => {
       stack: String(e && e.stack || '').slice(0, 1200) }, 'error');
     res.status(200).send('id_list_message=m-1607');
   }
-};
+});
 
 // ============================================================================
 // IN-GAME FLOW
