@@ -1622,14 +1622,43 @@ async function handleSelectPick(res, flow, saveFlow, game, player, choice) {
   return sendActionMenu(res, flow, saveFlow, [t]);
 }
 
-async function endTurn(res, flow, saveFlow, game, player) {
+async function endTurn(res, flow, saveFlow, game, player, retry = 0) {
+  // A waiting caller can update the shared game between our load and save.
+  // Recompute the end-turn operation against the latest state rather than
+  // losing the keypress or writing an obsolete copy of the game.
+  const persistTurn = async () => {
+    try {
+      await saveGame(game.code, game);
+      return true;
+    } catch (error) {
+      if (error.code !== 'HF_CONFLICT') throw error;
+      ivrLog('end_turn_conflict', { gameCode: game.code, playerId: player.id, retry }, 'warn');
+      const fresh = await loadGame(game.code);
+      if (!fresh) throw error;
+      const freshPlayer = fresh.players.find(p => p.id === player.id);
+      if (!freshPlayer) throw error;
+      if (fresh.players[fresh.turn]?.id !== player.id) {
+        // Another request already completed this turn. Never advance twice.
+        ivrLog('end_turn_already_advanced', { gameCode: game.code, playerId: player.id }, 'warn');
+        return sendGameState(res, flow, saveFlow, fresh, freshPlayer, []);
+      }
+      if (retry >= 5) {
+        // No state was committed by this request. Preserve the call and
+        // re-prompt rather than ending the IVR session.
+        const t = await msg('sRETRYTURN', 'המשחק מתעדכן. סיום התור לא נשמר. אנא הקישו שוב ארבע');
+        return sendActionMenu(res, flow, saveFlow, [t]);
+      }
+      await new Promise(resolve => setTimeout(resolve, 50 * (retry + 1)));
+      return endTurn(res, flow, saveFlow, fresh, freshPlayer, retry + 1);
+    }
+  };
   // Earned another roll by rolling a double this turn: stay on the same turn
   // and let the player roll again, rather than passing the turn along.
   if (player.extraRoll && !player.inJail) {
     player.extraRoll = false;
     player.hasRolled = false; // allow the bonus roll
     player.lastSeenSeq = game.logSeq;
-    await saveGame(game.code, game);
+    if (await persistTurn() !== true) return;
     const t = await msg('sAGAIN', 'הטלתם דאבל, אתם משחקים שוב. להטלת קוביות הקישו אחת');
     return sendActionMenu(res, flow, saveFlow, [t]);
   }
@@ -1648,7 +1677,7 @@ async function endTurn(res, flow, saveFlow, game, player) {
   await broadcastLog(game, `עובר תור ל${nextPlayer.name}`);
 
   player.lastSeenSeq = game.logSeq;
-  await saveGame(game.code, game);
+  if (await persistTurn() !== true) return;
 
   const t = await msg('sENDTURN', `סיימתם את תורכם. התור עובר ל${nextPlayer.name}`);
   // The player who just finished waits (hold music) until their next turn.
