@@ -50,8 +50,39 @@ const HOLD_SECONDS = 4; // short poll interval while waiting, so updates feel ne
 const TURN_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes
 const KEY_PREFIX = 'monopoly:';
 
+// Structured, privacy-conscious diagnostics for Vercel Function Logs.
+// Set IVR_DEBUG_LOGS=false to disable detailed events without redeploying.
+const IVR_DEBUG_LOGS = process.env.IVR_DEBUG_LOGS !== 'false';
+function ivrLog(event, details = {}, level = 'info') {
+  if (!IVR_DEBUG_LOGS && level === 'info') return;
+  const record = { service: 'monopoly-ivr', event, time: new Date().toISOString(), ...details };
+  (level === 'error' ? console.error : level === 'warn' ? console.warn : console.log)(JSON.stringify(record));
+}
+function safeCallTag(callId) {
+  // Correlation only; never print the caller's number or the raw call ID.
+  const value = String(callId || '');
+  let h = 2166136261;
+  for (let i = 0; i < value.length; i++) h = Math.imul(h ^ value.charCodeAt(i), 16777619);
+  return (h >>> 0).toString(36);
+}
+function gameSnapshot(game, player) {
+  if (!game) return { gameFound: false };
+  const active = game.players && game.players[game.turn];
+  return {
+    gameFound: true, gameCode: game.code, turn: game.turn,
+    activePlayerId: active && active.id, playerId: player && player.id,
+    hasRolled: player && player.hasRolled, extraRoll: player && player.extraRoll,
+    pendingBuy: game.pendingBuy, logSeq: game.logSeq,
+    lastSeenSeq: player && player.lastSeenSeq,
+    turnStartedAt: game.turnStartedAt,
+  };
+}
+
 // ---- Small Redis (Upstash REST) helper -------------------------------------
 async function redis(cmd) {
+  const started = Date.now();
+  const command = cmd[0];
+  const keyType = typeof cmd[1] === 'string' ? cmd[1].split(':')[1] : undefined;
   const res = await fetch(REDIS_URL, {
     method: 'POST',
     headers: {
@@ -61,6 +92,12 @@ async function redis(cmd) {
     body: JSON.stringify(cmd),
   });
   const data = await res.json();
+  const elapsedMs = Date.now() - started;
+  if (!res.ok || data.error) {
+    ivrLog('redis_error', { command, keyType, status: res.status, elapsedMs, error: String(data.error || 'HTTP error').slice(0, 200) }, 'error');
+    throw new Error('Redis request failed');
+  }
+  if (elapsedMs > 400) ivrLog('redis_slow', { command, keyType, elapsedMs }, 'warn');
   return data.result;
 }
 const rGet = async (k) => redis(['GET', KEY_PREFIX + k]);
@@ -77,7 +114,9 @@ async function loadGame(code) {
   return raw ? JSON.parse(raw) : null;
 }
 async function saveGame(code, game) {
+  const started = Date.now();
   await rSet(`game:${code}`, JSON.stringify(game), GAME_TTL);
+  ivrLog('game_saved', { ...gameSnapshot(game), elapsedMs: Date.now() - started });
 }
 
 // ---- Reconnect-by-phone index ---------------------------------------------
@@ -473,6 +512,27 @@ module.exports = async (req, res) => {
   const callId = params.ApiCallId || params.callId || 'unknown';
   const ext = params.ApiExtension || '';
   const hangup = params.hangup === 'yes';
+  const requestId = Math.random().toString(36).slice(2, 10);
+  const requestStarted = Date.now();
+  const callTag = safeCallTag(callId);
+  const receivedParams = Object.keys(params).filter(k => /^P\\d+$/.test(k));
+  const originalSend = res.send.bind(res);
+  res.send = function instrumentedSend(body) {
+    const output = typeof body === 'string' ? body : '';
+    ivrLog('request_end', {
+      requestId, callTag, durationMs: Date.now() - requestStarted,
+      statusCode: res.statusCode,
+      responseType: output.includes('read=') ? 'read' : output.includes('go_to_folder=') ? 'redirect' : 'other',
+      responseBytes: Buffer.byteLength(output),
+      responseReadParam: (output.match(/read=([^,>]+)/) || [])[1],
+    });
+    return originalSend(body);
+  };
+  ivrLog('request_start', {
+    requestId, callTag, method: req.method, hangup,
+    receivedParamNames: receivedParams.slice(-12), receivedParamCount: receivedParams.length,
+    duplicateParamNames: receivedParams.filter(k => Array.isArray(params[k])),
+  });
 
   try {
     if (hangup) {
@@ -482,12 +542,23 @@ module.exports = async (req, res) => {
 
     const flowKey = `call:${callId}`;
     let flow = JSON.parse((await rGet(flowKey)) || '{}');
+    ivrLog('flow_loaded', {
+      requestId, callTag, step: flow.step || null, seq: flow.seq || 0,
+      expect: flow.expect || null, expectKind: flow.expectKind || null,
+      expectedValuePresent: !!(flow.expect && params[flow.expect] !== undefined),
+      expectedValue: flow.expect && params[flow.expect] !== undefined
+        ? String(params[flow.expect]).slice(0, 12) : null,
+    });
 
     // Helper to persist the flow object AND always refresh its TTL, so a
     // long game (many idle-wait polls while it's not your turn) never lets
     // the call's flow record silently expire mid-game and bounce the
     // caller back to the main menu.
-    const saveFlow = async (f) => rSet(flowKey, JSON.stringify(f), 3600);
+    const saveFlow = async (f) => {
+      await rSet(flowKey, JSON.stringify(f), 3600);
+      ivrLog('flow_saved', { requestId, callTag, step: f.step, seq: f.seq,
+        expect: f.expect, expectKind: f.expectKind });
+    };
 
     // ---- Entry point ---------------------------------------------------
     if (!flow.step) {
@@ -735,7 +806,8 @@ module.exports = async (req, res) => {
     const err = await msg('s1099', 'אירעה שגיאה לא צפויה, חוזרים לתפריט הראשי');
     res.status(200).send(respond([err], { extra: `go_to_folder=/${ext}` }));
   } catch (e) {
-    console.error(e);
+    ivrLog('handler_error', { requestId, callTag, message: String(e && e.message || e),
+      stack: String(e && e.stack || '').slice(0, 1200) }, 'error');
     res.status(200).send('id_list_message=m-1607');
   }
 };
@@ -861,6 +933,9 @@ async function handleInGameAction(res, flow, saveFlow, game, player, params) {
   // "no input". A real keypress like '0' is a non-empty string and survives.
   const value = rawValue === undefined || rawValue === '' ? undefined : rawValue;
   const hasMenuValue = MENU_KINDS.includes(expectKind) && value !== undefined;
+  ivrLog('game_input', { ...gameSnapshot(game, player), expectKind,
+    expectedParam: flow.expect, value: value === undefined ? null : String(value).slice(0, 12),
+    hasMenuValue });
 
   // If the active player is the one contacting us, refresh their anti-stuck
   // timer so an actively-playing player is never auto-skipped.
@@ -944,7 +1019,9 @@ async function rollDiceAndMove(res, flow, saveFlow, game, player) {
   // total such as 5 (bug ד). A player may roll again ONLY when they earned it
   // by rolling a double (player.extraRoll). Otherwise they must build / check
   // status / end the turn.
+  ivrLog('dice_attempt', { ...gameSnapshot(game, player) });
   if (player.hasRolled && !player.extraRoll) {
+    ivrLog('dice_blocked', { ...gameSnapshot(game, player), reason: 'already_rolled' });
     const t = await msg(
       's1024',
       'כבר הטלתם קוביות בתור זה. לבניית בתים הקישו שלוש, לסיום התור הקישו ארבע'
@@ -955,6 +1032,7 @@ async function rollDiceAndMove(res, flow, saveFlow, game, player) {
   const d1 = 1 + Math.floor(Math.random() * 6);
   const d2 = 1 + Math.floor(Math.random() * 6);
   const isDouble = d1 === d2;
+  ivrLog('dice_result', { ...gameSnapshot(game, player), d1, d2, isDouble });
 
   player.hasRolled = true;
   // Consume any previously-earned bonus roll; a fresh one is granted below
@@ -1516,7 +1594,10 @@ async function endTurn(res, flow, saveFlow, game, player) {
 
   // Advance to the next non-bankrupt player (also resets the anti-stuck timer
   // and the incoming player's per-turn state).
+  const previousTurn = game.turn;
   const nextPlayer = advanceTurn(game);
+  ivrLog('turn_advanced', { ...gameSnapshot(game, player), previousTurn,
+    nextPlayerId: nextPlayer.id });
   await broadcastLog(game, `עובר תור ל${nextPlayer.name}`);
 
   player.lastSeenSeq = game.logSeq;
