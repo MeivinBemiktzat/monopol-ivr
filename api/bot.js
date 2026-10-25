@@ -132,6 +132,7 @@ function playOneBot(game) {
   for (let attempt = 0; attempt < 3 && !bot.bankrupt; attempt++) {
     const d1 = roll(), d2 = roll(), total = d1 + d2, double = d1 === d2;
     note(game, `${bot.name} הטיל ${d1} ו${d2}`);
+    const leavingJail = bot.inJail;
     if (bot.inJail) {
       if (double || bot.getOutFree > 0 || bot.jailTurns >= 2) {
         if (!double && bot.getOutFree > 0) bot.getOutFree--;
@@ -158,7 +159,7 @@ function playOneBot(game) {
     if (before + total >= 40) bot.money += board.goMoney;
     note(game, `${bot.name} התקדם ${total} משבצות ונחת על ${sqAt(bot.pos).name}`);
     land(game, bot, total);
-    if (!double || bot.inJail) break;
+    if (!double || leavingJail || bot.inJail) break;
   }
   build(game, bot);
   const alive = game.players.filter(p => !p.bankrupt);
