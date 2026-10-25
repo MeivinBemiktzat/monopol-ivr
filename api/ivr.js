@@ -109,6 +109,7 @@ async function redis(cmd) {
 }
 // HF Buckets is the active backend; Upstash is retained for rollback only.
 const hf = require('./hf-storage');
+const { playOneBot } = require('./bot');
 const rGet = async k => {
   const started = Date.now();
   const result = await hf.get(KEY_PREFIX + k);
@@ -657,13 +658,13 @@ module.exports = async (req, res) => hf.runWithContext(async () => {
         return sendGameState(res, flow, saveFlow, game, player, [t]);
       }
       if (choice === '1') {
-        flow = { step: 'ask_player_count', seq: flow.seq };
+        flow = { step: 'ask_game_mode', seq: flow.seq };
         const pName = nextParamName(flow);
         flow.expect = pName;
         await saveFlow(flow);
-        const t = await msg('s1001', 'כמה שחקנים ישתתפו במשחק? הקישו מספר בין שתיים לשש');
+        const t = await msg('sBOTMODE', 'למשחק עם שחקנים נוספים באמצעות קוד הקישו אחת. למשחק מול בוטים הקישו שתיים');
         res.status(200).send(
-          respond([t], { readParams: menuReadParams({ name: pName, allowed: '23456' }) })
+          respond([t], { readParams: menuReadParams({ name: pName, allowed: '12' }) })
         );
         return;
       }
@@ -685,10 +686,28 @@ module.exports = async (req, res) => hf.runWithContext(async () => {
       return;
     }
 
+    if (flow.step === 'ask_game_mode') {
+      const mode = String(params[flow.expect] || '');
+      if (!['1','2'].includes(mode)) {
+        const pName = nextParamName(flow); flow.expect = pName; await saveFlow(flow);
+        const t = await msg('sBOTMODE', 'למשחק עם שחקנים הקישו אחת. למשחק מול בוטים הקישו שתיים');
+        res.status(200).send(respond([t], { readParams: menuReadParams({ name: pName, allowed: '12' }) }));
+        return;
+      }
+      flow = { step: mode === '2' ? 'ask_bot_count' : 'ask_player_count', seq: flow.seq };
+      const pName = nextParamName(flow); flow.expect = pName; await saveFlow(flow);
+      const t = mode === '2'
+        ? await msg('sBOTCOUNT', 'כמה בוטים ישחקו מולכם? הקישו מספר מאחת עד חמש')
+        : await msg('s1001', 'כמה שחקנים ישתתפו במשחק? הקישו מספר בין שתיים לשש');
+      res.status(200).send(respond([t], { readParams: menuReadParams({ name: pName, allowed: mode === '2' ? '12345' : '23456' }) }));
+      return;
+    }
+
     // ---- CREATE GAME: ask player count -> create -> ask name -------------
-    if (flow.step === 'ask_player_count') {
+    if (flow.step === 'ask_player_count' || flow.step === 'ask_bot_count') {
+      const botMode = flow.step === 'ask_bot_count';
       const n = parseInt(params[flow.expect], 10);
-      if (!n || n < 2 || n > 6) {
+      if (!n || (botMode ? n < 1 || n > 5 : n < 2 || n > 6)) {
         const err = await msg('s1004', 'מספר לא תקין. נסו שוב');
         res.status(200).send(respond([err], { extra: `go_to_folder=/${ext}` }));
         return;
@@ -700,7 +719,8 @@ module.exports = async (req, res) => hf.runWithContext(async () => {
         tries++;
       }
       const game = newGame(code);
-      game.expectedPlayers = n;
+      game.expectedPlayers = botMode ? n + 1 : n;
+      game.botMode = botMode;
       await saveGame(code, game);
 
       flow = { step: 'ask_name_new', code, seq: flow.seq };
@@ -710,7 +730,9 @@ module.exports = async (req, res) => hf.runWithContext(async () => {
 
       const t1 = await msg('s1005', 'נוצר משחק חדש. קוד המשחק שלכם הוא');
       const codeDigits = `d-${code}`;
-      const t2 = await msg('s1006', 'שמרו את הקוד ומסרו אותו לשאר השחקנים. כעת הקלידו את שמכם באמצעות המקלדת ולאחר מכן הקישו סולמית');
+      const t2 = botMode
+        ? await msg('sBOTNAME', 'המשחק מול הבוטים מוכן. כעת הקלידו את שמכם באמצעות המקלדת ולאחר מכן הקישו סולמית')
+        : await msg('s1006', 'שמרו את הקוד ומסרו אותו לשאר השחקנים. כעת הקלידו את שמכם באמצעות המקלדת ולאחר מכן הקישו סולמית');
       res.status(200).send(
         respond([t1, codeDigits, t2], {
           readParams: keyboardReadParams({ name: pName }),
@@ -733,7 +755,7 @@ module.exports = async (req, res) => hf.runWithContext(async () => {
         res.status(200).send(respond([err], { extra: `go_to_folder=/${ext}` }));
         return;
       }
-      if (game.players.length >= game.expectedPlayers) {
+      if (game.botMode || game.players.length >= game.expectedPlayers) {
         const err = await msg('s1009', 'המשחק מלא');
         res.status(200).send(respond([err], { extra: `go_to_folder=/${ext}` }));
         return;
@@ -777,6 +799,15 @@ module.exports = async (req, res) => hf.runWithContext(async () => {
         lastHeardTurn: -1, // last game.turn value we announced to this player
       };
       game.players.push(player);
+      if (game.botMode && flow.step === 'ask_name_new') {
+        for (let i = 1; i < game.expectedPlayers; i++) game.players.push({
+          id: `p${i + 1}`, isBot: true, name: `בוט ${i}`,
+          callId: null, phone: '', money: board.startMoney, pos: 0,
+          inJail: false, jailTurns: 0, doublesStreak: 0, hasRolled: false,
+          extraRoll: false, getOutFree: 0, bankrupt: false,
+          lastSeenSeq: 0, lastHeardTurn: -1
+        });
+      }
 
       const readyToStart = game.players.length >= game.expectedPlayers;
       if (readyToStart) {
@@ -835,7 +866,11 @@ module.exports = async (req, res) => hf.runWithContext(async () => {
         return;
       }
 
-      return handleInGameAction(res, flow, saveFlow, game, player, params);
+      if (game.botMode && currentPlayer(game)?.isBot) {
+         await advanceBotTurns(game);
+         await saveGame(game.code, game);
+       }
+       return handleInGameAction(res, flow, saveFlow, game, player, params);
     }
 
     // Unknown step fallback
@@ -885,6 +920,16 @@ const ACTION_ALLOWED = '0123456*';
 const ACTION_MENU_TEXT =
   'להטלת קוביות הקישו אחת. לשמיעת מצב אישי הקישו שתיים. לבניית בתים הקישו שלוש. לסיום התור הקישו ארבע. למצב כל השחקנים הקישו חמש. לניהול נכסים הקישו שש. לחזרה על התפריט הקישו אפס. לעזרה הקישו כוכבית';
 
+async function advanceBotTurns(game) {
+  if (!game.botMode || game.over) return;
+  let turns = 0;
+  while (currentPlayer(game)?.isBot && !game.over && turns < 5) {
+    playOneBot(game);
+    turns++;
+  }
+  ivrLog('bot_turns', { gameCode: game.code, turns, nextPlayerId: currentPlayer(game)?.id });
+}
+
 async function sendGameState(res, flow, saveFlow, game, player, prefixSegments = [], attempt = 0) {
   const safeSave = async () => {
     try {
@@ -901,6 +946,10 @@ async function sendGameState(res, flow, saveFlow, game, player, prefixSegments =
       return false;
     }
   };
+  if (game.botMode && currentPlayer(game)?.isBot) {
+    await advanceBotTurns(game);
+    if (!await safeSave()) return;
+  }
   // A non-active caller's poll can trigger the anti-stuck auto-skip.
   let skippedTurn = false;
   if (currentPlayer(game).id !== player.id) {
@@ -1699,6 +1748,13 @@ async function endTurn(res, flow, saveFlow, game, player, retry = 0) {
 
   player.lastSeenSeq = game.logSeq;
   if (await persistTurn() !== true) return;
+  if (game.botMode && !game.over) {
+    await advanceBotTurns(game);
+    await saveGame(game.code, game);
+    return sendGameState(res, flow, saveFlow, game, player, [
+      await msg('sBOTTURNS', 'הבוטים סיימו את תורם')
+    ]);
+  }
 
   const t = await msg('sENDTURN', `סיימתם את תורכם. התור עובר ל${nextPlayer.name}`);
   // The player who just finished waits (hold music) until their next turn.
